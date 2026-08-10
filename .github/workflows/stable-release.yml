@@ -1,0 +1,127 @@
+name: cachyos-stable-release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cachyos-stable
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: bump fork to latest 6.18.y
+    runs-on: ubuntu-latest
+    env:
+      FORK_REPO: adithyagenie/linux
+      BASE_BRANCH: 6.18/base
+      STABLE_GITHUB: https://github.com/gregkh/linux.git
+      STABLE_KERNELORG: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+
+    steps:
+      - name: Checkout fork base (full history for merge-bases)
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch topic branches + release tags
+        run: |
+          git fetch --prune --no-tags origin \
+            '+refs/heads/6.18/*:refs/remotes/origin/6.18/*' \
+            '+refs/tags/cachyos-*:refs/tags/cachyos-*'
+          echo "remote cachyos tags: $(git tag -l 'cachyos-6.18.*-1' | wc -l)"
+          echo "$(git tag -l 'cachyos-6.18.*-1' | sort -V)"
+
+      - name: git configuration (anonymous, no inherited signing)
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "GitHub Actions"
+          git config commit.gpgsign false
+          git config tag.gpgsign false
+
+      - name: latest upstream v6.18.y version
+        id: latest
+        run: bash .github/scripts/stable-release/01_latest.sh
+
+      - name: decide if a bump is needed (idempotency)
+        id: check
+        env:
+          UPSTREAM_VERSION: ${{ steps.latest.outputs.upstream_version }}
+          UPSTREAM_COMMIT: ${{ steps.latest.outputs.upstream_commit }}
+        run: bash .github/scripts/stable-release/02_check.sh
+
+      - name: merge upstream into base
+        id: merge
+        if: ${{ steps.check.outputs.raise == 'true' }}
+        env:
+          UPSTREAM_VERSION: ${{ steps.latest.outputs.upstream_version }}
+          UPSTREAM_COMMIT: ${{ steps.latest.outputs.upstream_commit }}
+        run: bash .github/scripts/stable-release/03_merge.sh
+
+      - name: tag the merge
+        id: tag
+        if: ${{ steps.check.outputs.raise == 'true' && steps.merge.outputs.merged == 'true' }}
+        env:
+          UPSTREAM_VERSION: ${{ steps.latest.outputs.upstream_version }}
+          PREVIOUS_RELEASE_TAG: ${{ steps.check.outputs.previous_release_tag }}
+          NEW_RELEASE_TAG: ${{ steps.check.outputs.new_release_tag }}
+        run: bash .github/scripts/stable-release/04_tag.sh
+
+      - name: push tag + branch
+        if: ${{ steps.check.outputs.raise == 'true' && steps.merge.outputs.merged == 'true' }}
+        env:
+          UPSTREAM_VERSION: ${{ steps.latest.outputs.upstream_version }}
+          NEW_RELEASE_TAG: ${{ steps.check.outputs.new_release_tag }}
+          BASE_BRANCH: ${{ env.BASE_BRANCH }}
+        run: bash .github/scripts/stable-release/05_push.sh
+
+      - name: build tarball + SRI hash
+        id: asset
+        if: ${{ steps.check.outputs.raise == 'true' && steps.merge.outputs.merged == 'true' }}
+        env:
+          NEW_RELEASE_TAG: ${{ steps.check.outputs.new_release_tag }}
+        run: bash .github/scripts/stable-release/06_asset.sh
+
+      - name: generate CachyOS-style release notes
+        id: changelog
+        if: ${{ steps.check.outputs.raise == 'true' && steps.merge.outputs.merged == 'true' }}
+        env:
+          UPSTREAM_VERSION: ${{ steps.latest.outputs.upstream_version }}
+          UPSTREAM_COMMIT: ${{ steps.latest.outputs.upstream_commit }}
+          PREVIOUS_RELEASE_TAG: ${{ steps.check.outputs.previous_release_tag }}
+          NEW_RELEASE_TAG: ${{ steps.check.outputs.new_release_tag }}
+        run: bash .github/scripts/stable-release/07_changelog.sh
+
+      - name: create / update GitHub Release + upload tarball
+        if: ${{ steps.check.outputs.raise == 'true' && steps.merge.outputs.merged == 'true' }}
+        env:
+          NEW_RELEASE_TAG: ${{ steps.check.outputs.new_release_tag }}
+          UPSTREAM_VERSION: ${{ steps.latest.outputs.upstream_version }}
+          NOTES_FILE: ${{ steps.changelog.outputs.notes_file }}
+          TARBALL: ${{ steps.asset.outputs.tar }}
+          ASSET_SHA256: ${{ steps.asset.outputs.sha256 }}
+        run: bash .github/scripts/stable-release/08_release.sh
+
+      - name: notify telegram
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+          FORK_REPO: ${{ env.FORK_REPO }}
+          UPSTREAM_VERSION: ${{ steps.latest.outputs.upstream_version }}
+          MERGE_CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          RAISE: ${{ steps.check.outputs.raise }}
+          NEW_RELEASE_TAG: ${{ steps.check.outputs.new_release_tag }}
+        run: |
+          bash .github/scripts/stable-release/09_notify.sh \
+            || printf 'warning: telegram notification failed (rc = %s)\n' "$?"
