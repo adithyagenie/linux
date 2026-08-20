@@ -3,7 +3,7 @@ name: cachyos-stable-release
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "30 18 * * *"
 
 permissions:
   contents: write
@@ -102,7 +102,8 @@ jobs:
           NEW_RELEASE_TAG: ${{ steps.check.outputs.new_release_tag }}
         run: bash .github/scripts/stable-release/07_changelog.sh
 
-      - name: create / update GitHub Release + upload tarball
+      - id: release
+        name: create / update GitHub Release + upload tarball
         if: ${{ steps.check.outputs.raise == 'true' && steps.merge.outputs.merged == 'true' }}
         env:
           NEW_RELEASE_TAG: ${{ steps.check.outputs.new_release_tag }}
@@ -119,9 +120,13 @@ jobs:
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
           FORK_REPO: ${{ env.FORK_REPO }}
           UPSTREAM_VERSION: ${{ steps.latest.outputs.upstream_version }}
-          MERGE_CONFLICTS: ${{ steps.merge.outputs.conflicts }}
-          RAISE: ${{ steps.check.outputs.raise }}
+          PREVIOUS_RELEASE_TAG: ${{ steps.check.outputs.previous_release_tag }}
           NEW_RELEASE_TAG: ${{ steps.check.outputs.new_release_tag }}
+          MERGED: ${{ steps.merge.outputs.merged }}
+          MERGE_CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          MERGE_LOG: ${{ steps.merge.outputs.log_file }}
+          RAISE: ${{ steps.check.outputs.raise }}
+          RELEASE_URL: ${{ steps.release.outputs.release_url }}
         run: |
           bash .github/scripts/stable-release/09_notify.sh \
             || printf 'warning: telegram notification failed (rc = %s)\n' "$?"

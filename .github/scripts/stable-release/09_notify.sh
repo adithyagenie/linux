@@ -1,59 +1,77 @@
 #!/usr/bin/env bash
-# notify — telegram announcement after the bump pipeline.
-# Env: UPSTREAM_VERSION (falls back to NEW_RELEASE_TAG), MERGE_CONFLICTS, RAISE (true/false),
-#      FORK_REPO, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS (comma- or space-separated)
+# notify — telegram announcement, only when the bump actually ran.
+#   merged=true, no conflicts  → release message (markdown link, no previews)
+#   merged=false (conflicts)   → failure message + merge log attached
+#   RAISE != true (no-op)      → silent, exit 0
+# Env: UPSTREAM_VERSION, PREVIOUS_RELEASE_TAG, NEW_RELEASE_TAG, MERGED,
+#      MERGE_CONFLICTS, RAISE, FORK_REPO, RELEASE_URL, MERGE_LOG (path),
+#      TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS (comma- or whitespace-separated)
 set -euo pipefail
 
 log(){ printf '› %s\n' "$*"; }
 
 [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_IDS:-}" ] || { log "no telegram secrets — skipping"; exit 0; }
 
-MERGE_CONFLICTS=${MERGE_CONFLICTS:-0}
-RAISE=${RAISE:-true}
+RAISE="${RAISE:-}"
+MERGED="${MERGED:-}"
+MERGE_CONFLICTS="${MERGE_CONFLICTS:-0}"
 
-# Version for the message: prefer UPSTREAM_VERSION, else derive from the tag.
-VERSION="${UPSTREAM_VERSION:-${NEW_RELEASE_TAG:-}}"
-VERSION="${VERSION#cachyos-}"
-VERSION="${VERSION%-1}"
-[ -n "$VERSION" ] || VERSION="unknown"
-
+# No bump happened this run → stay silent.
 if [ "$RAISE" != "true" ]; then
-  status_desc="no-op"
-  emoji="ℹ️"
-elif [ "$MERGE_CONFLICTS" -gt 0 ] 2>/dev/null; then
-  status_desc="conflict"
-  emoji="❌"
+  log "no-op run — no telegram message"
+  exit 0
+fi
+
+UPSTREAM_VERSION="${UPSTREAM_VERSION:?upstream version missing}"
+NEW_RELEASE_TAG="${NEW_RELEASE_TAG:?new release tag missing}"
+RELEASE_URL="${RELEASE_URL:-https://github.com/${FORK_REPO}/releases/tag/${NEW_RELEASE_TAG}}"
+
+# old -> new version numbers
+NEW_V="${NEW_RELEASE_TAG#cachyos-}"; NEW_V="${NEW_V%-1}"
+OLD_V="${PREVIOUS_RELEASE_TAG:-}"
+OLD_V="${OLD_V#cachyos-}"; OLD_V="${OLD_V%-1}"
+
+if [ "$MERGED" = "true" ]; then
+  kind="release"
+  TEXT="cachyos kernel update
+Version ${OLD_V:-unknown} -> ${NEW_V}
+[Release tag](${RELEASE_URL})"
 else
-  status_desc="clean"
-  emoji="✅"
+  kind="conflict"
+  TEXT="cachyos kernel update failed
+Version ${OLD_V:-unknown} -> ${NEW_V}
+${MERGE_CONFLICTS} merge conflicts.
+log file attached"
 fi
 
-URL="https://github.com/${FORK_REPO}/releases/tag/${NEW_RELEASE_TAG}"
+# Split CHAT_IDS on comma and/or whitespace.
+IFS=', \t' read -ra IDS <<< "${TELEGRAM_CHAT_IDS//,/ }"
 
-# Split CHAT_IDS on comma OR whitespace.
-# Use printf to build a single string and split on any of , ; \n or space
-tok=""
-for ch in "${TELEGRAM_CHAT_IDS//,/ }"; do
-  tok+="$ch "
-done
-# trailing space-offTokenizer? split posperse:
-IFS=' ' read -ra IDS_UNSET <<< "$tok"
-# fall back to ", " if still single — re-split on ',' as well
-if [ "${#IDS_UNSET[@]}" -eq 1 ] && [[ "${IDS_UNSET[0]}" == *","* ]]; then
-  IFS=',' read -ra IDS_UNSET <<< "${IDS_UNSET[0]}"
-fi
-
-for CHAT_ID in "${IDS_UNSET[@]}"; do
+for CHAT_ID in "${IDS[@]}"; do
   [ -z "$CHAT_ID" ] && continue
-  CURL_ARGS=(
-    -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
-    -d "chat_id=$CHAT_ID"
-    -d "disable_web_page_preview=true"
-  )
-  # '+' encodes as space each multiline; use data-urlencode for text so \n become %0A
-  CURL_ARGS+=( --data-urlencode "text=[$emoji] CachyOS stable $status_desc. Version: ${VERSION}. Conflicts: ${MERGE_CONFLICTS}. ${URL}" )
-  curl "${CURL_ARGS[@]}" >/dev/null || log "curl to chat $CHAT_ID failed"
-  log "sent telegram update to $CHAT_ID"
+  if [ "$kind" = "release" ]; then
+    curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d "chat_id=$CHAT_ID" \
+      -d "parse_mode=Markdown" \
+      --data-urlencode 'link_preview_options={"is_disabled":true}' \
+      --data-urlencode "text=$TEXT" >/dev/null \
+      || log "curl sendMessage to chat $CHAT_ID failed"
+  else
+    LOG_FILE="${MERGE_LOG:-}"
+    if [ -z "$LOG_FILE" ] || [ ! -f "$LOG_FILE" ]; then
+      LOG_FILE=$(mktemp)
+      printf 'merge log unavailable (merge step did not produce a log file)\n' > "$LOG_FILE"
+    fi
+    curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      -d "chat_id=$CHAT_ID" \
+      --data-urlencode "text=$TEXT" >/dev/null \
+      || log "curl sendMessage to chat $CHAT_ID failed"
+    curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+      -d "chat_id=$CHAT_ID" \
+      -F "document=@${LOG_FILE};filename=merge-$NEW_RELEASE_TAG.log" >/dev/null \
+      || log "curl sendDocument to chat $CHAT_ID failed"
+  fi
+  log "sent telegram $kind message to $CHAT_ID"
 done
 
 exit 0
