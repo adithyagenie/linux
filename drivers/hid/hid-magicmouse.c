@@ -1646,6 +1646,25 @@ static void magicmouse_remove(struct hid_device *hdev)
 	hid_hw_stop(hdev);
 }
 
+#ifdef CONFIG_PM
+static int magicmouse_reset_resume(struct hid_device *hdev)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+
+	if (hdev->bus == BUS_SPI)
+		return magicmouse_enable_multitouch(hdev);
+
+	/* The device drops out of multitouch mode on resume; re-send the
+	 * enable report.  Only the HID_TYPE_USBMOUSE interface accepts it, and
+	 * it must be deferred. Sending it inline here is too early.
+	 */
+	if (msc && hdev->type == HID_TYPE_USBMOUSE)
+		schedule_delayed_work(&msc->work, msecs_to_jiffies(500));
+
+	return 0;
+}
+#endif
+
 static const __u8 *magicmouse_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 					   unsigned int *rsize)
 {
@@ -1718,20 +1737,10 @@ static const struct hid_device_id magic_mice[] = {
 	{ HID_SPI_DEVICE(SPI_VENDOR_ID_APPLE, HID_ANY_ID),
 	  .driver_data = 0 },
 	{ HID_DEVICE(BUS_HOST, HID_GROUP_ANY, HOST_VENDOR_ID_APPLE,
-                     HID_ANY_ID), .driver_data = 0 },
+		     HID_ANY_ID), .driver_data = 0 },
 	{ }
 };
 MODULE_DEVICE_TABLE(hid, magic_mice);
-
-#ifdef CONFIG_PM
-static int magicmouse_reset_resume(struct hid_device *hdev)
-{
-	if (hdev->bus == BUS_SPI)
-		return magicmouse_enable_multitouch(hdev);
-
-	return 0;
-}
-#endif
 
 static struct hid_driver magicmouse_driver = {
 	.name = "magicmouse",
@@ -1744,9 +1753,8 @@ static struct hid_driver magicmouse_driver = {
 	.input_mapping = magicmouse_input_mapping,
 	.input_configured = magicmouse_input_configured,
 #ifdef CONFIG_PM
-        .reset_resume = magicmouse_reset_resume,
+	.reset_resume = magicmouse_reset_resume,
 #endif
-
 };
 module_hid_driver(magicmouse_driver);
 
