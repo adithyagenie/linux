@@ -67,7 +67,7 @@ for CHAT_ID in "${IDS[@]}"; do
       --data-urlencode "text=$TEXT" >/dev/null \
       || log "curl sendMessage to chat $CHAT_ID failed"
     curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
-      -d "chat_id=$CHAT_ID" \
+      -F "chat_id=$CHAT_ID" \
       -F "document=@${LOG_FILE};filename=merge-$NEW_RELEASE_TAG.log" >/dev/null \
       || log "curl sendDocument to chat $CHAT_ID failed"
   fi
