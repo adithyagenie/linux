@@ -28,14 +28,54 @@ jobs:
     steps:
       - name: latest upstream v6.18.y version
         id: latest
-        run: bash .github/scripts/stable-release/01_latest.sh
+        run: |
+          set -euo pipefail
+          STABLE_GITHUB="${STABLE_GITHUB:-https://github.com/gregkh/linux.git}"
+          STABLE_KO="${STABLE_KERNELORG:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
+          pairs=$(git ls-remote --tags "$STABLE_GITHUB" 'v6.18.*^{}' 'v6.18.*' 2>/dev/null \
+               || git ls-remote --tags "$STABLE_KO"      'v6.18.*^{}' 'v6.18.*' 2>/dev/null)
+          best=$(printf '%s\n' "$pairs" \
+            | awk '/\^\{\}$/ && $2 !~ /-rc/ { sub(/\^\{\}$/,"",$2); print $2 "\t" $1 }' \
+            | sed 's|refs/tags/v||' \
+            | sort -V \
+            | tail -n1)
+          if [ -z "$best" ]; then
+            best=$(printf '%s\n' "$pairs" \
+              | awk '!/\^\{\}$/ && $2 !~ /-rc/ { print $2 "\t" $1 }' \
+              | sed 's|refs/tags/v||' \
+              | sort -V | tail -n1)
+          fi
+          [ -n "$best" ] || { echo "no upstream v6.18.x tag found" >&2; exit 1; }
+          tag_v=${best%%$'\t'*}
+          sha=${best##*$'\t'}
+          echo "upstream_tag=v${tag_v}" >> "$GITHUB_OUTPUT"
+          echo "upstream_version=${tag_v}" >> "$GITHUB_OUTPUT"
+          echo "upstream_commit=${sha}" >> "$GITHUB_OUTPUT"
+          printf '› upstream latest: v%s @ %s\n' "${tag_v}" "${sha:0:12}"
 
       - name: decide if a bump is needed (idempotency)
         id: check
         env:
           UPSTREAM_VERSION: ${{ steps.latest.outputs.upstream_version }}
           FORK_REPO: ${{ env.FORK_REPO }}
-        run: bash .github/scripts/stable-release/02_check.sh
+        run: |
+          set -euo pipefail
+          UPSTREAM_VERSION="${UPSTREAM_VERSION:?}"
+          FORK_REPO="${FORK_REPO:?}"
+          NEW_RELEASE="cachyos-$UPSTREAM_VERSION-1"
+          if git ls-remote --exit-code "https://github.com/$FORK_REPO" "refs/tags/$NEW_RELEASE" >/dev/null 2>&1; then
+            raise="false"; reason="tag $NEW_RELEASE already exists"
+          else
+            raise="true"; reason="upstream ahead ($UPSTREAM_VERSION not yet released)"
+          fi
+          prev_release_tag=$(git ls-remote "https://github.com/$FORK_REPO" 'refs/tags/cachyos-6.18.*-1' \
+            | awk '{print $2}' | sed 's|refs/tags/||' | sort -V | tail -n1 || true)
+          [ -n "$prev_release_tag" ] || { echo "can't determine previous release"; exit 1; }
+          echo "raise=$raise" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "previous_release_tag=$prev_release_tag" >> "$GITHUB_OUTPUT"
+          echo "new_release_tag=$NEW_RELEASE" >> "$GITHUB_OUTPUT"
+          printf '› check: %s\n' "$reason"
 
       - name: Checkout fork base (full history)
         if: ${{ steps.check.outputs.raise == 'true' }}
