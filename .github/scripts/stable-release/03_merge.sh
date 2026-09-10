@@ -10,7 +10,8 @@ log(){ printf '› %s\n' "$*"; }
 
 UPSTREAM_VERSION="${UPSTREAM_VERSION:?upstream version required}"
 BASE_BRANCH="${BASE_BRANCH:-6.18/base}"
-STABLE_GITHUB="${STABLE_GITHUB:-https://github.com/gregkh/linux.git}"
+UPSTREAM_GIT="${UPSTREAM_GIT:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
+UPSTREAM_GIT_ALT="${UPSTREAM_GIT_ALT:-https://android.googlesource.com/kernel/common}"
 
 MERGE_LOG_FILE="/tmp/merge-$UPSTREAM_VERSION.log"
 
@@ -19,9 +20,13 @@ log "merging upstream v$UPSTREAM_VERSION into $BASE_BRANCH (log: $MERGE_LOG_FILE
 
 # --- fetch: output to log file only ---
 {
-  printf '## fetch v%s from %s (%s)\n' "$UPSTREAM_VERSION" "$STABLE_GITHUB" "$(date -u '+%F %T UTC')"
+  printf '## fetch v%s from %s (%s)\n' "$UPSTREAM_VERSION" "$UPSTREAM_GIT" "$(date -u '+%F %T UTC')"
 } > "$MERGE_LOG_FILE"
-git fetch --no-tags "$STABLE_GITHUB" "refs/tags/v$UPSTREAM_VERSION:refs/tags/v$UPSTREAM_VERSION" >> "$MERGE_LOG_FILE" 2>&1
+git fetch --no-tags "$UPSTREAM_GIT" "refs/tags/v$UPSTREAM_VERSION:refs/tags/v$UPSTREAM_VERSION" >> "$MERGE_LOG_FILE" 2>&1
+if [ $? -ne 0 ]; then
+  printf '## retry fetch from %s\n' "$UPSTREAM_GIT_ALT" >> "$MERGE_LOG_FILE"
+  git fetch --no-tags "$UPSTREAM_GIT_ALT" "refs/tags/v$UPSTREAM_VERSION:refs/tags/v$UPSTREAM_VERSION" >> "$MERGE_LOG_FILE" 2>&1
+fi
 fetch_rc=$?
 printf 'fetch rc=%d\n\n' "$fetch_rc" >> "$MERGE_LOG_FILE"
 
@@ -39,7 +44,7 @@ fi
 # --- merge: output to log file only ---
 printf '## merge v%s into %s\n' "$UPSTREAM_VERSION" "$BASE_BRANCH" >> "$MERGE_LOG_FILE"
 git -c commit.gpgsign=false merge --no-ff "v$UPSTREAM_VERSION" \
-  -m "Merge tag 'v$UPSTREAM_VERSION' of $STABLE_GITHUB into $BASE_BRANCH" >> "$MERGE_LOG_FILE" 2>&1
+  -m "Merge tag 'v$UPSTREAM_VERSION' into $BASE_BRANCH" >> "$MERGE_LOG_FILE" 2>&1
 merge_rc=$?
 printf 'merge rc=%d\n' "$merge_rc" >> "$MERGE_LOG_FILE"
 

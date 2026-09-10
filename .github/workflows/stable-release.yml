@@ -19,8 +19,8 @@ jobs:
     env:
       FORK_REPO: adithyagenie/linux
       BASE_BRANCH: 6.18/base
-      STABLE_GITHUB: https://github.com/gregkh/linux.git
-      STABLE_KERNELORG: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+      UPSTREAM_GIT: https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+      UPSTREAM_GIT_ALT: https://android.googlesource.com/kernel/common
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
@@ -30,10 +30,10 @@ jobs:
         id: latest
         run: |
           set -euo pipefail
-          STABLE_GITHUB="${STABLE_GITHUB:-https://github.com/gregkh/linux.git}"
-          STABLE_KO="${STABLE_KERNELORG:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
-          pairs=$(git ls-remote --tags "$STABLE_GITHUB" 'v6.18.*^{}' 'v6.18.*' 2>/dev/null \
-               || git ls-remote --tags "$STABLE_KO"      'v6.18.*^{}' 'v6.18.*' 2>/dev/null)
+          UPSTREAM_GIT="${UPSTREAM_GIT:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
+          UPSTREAM_GIT_ALT="${UPSTREAM_GIT_ALT:-https://android.googlesource.com/kernel/common}"
+          pairs=$(git ls-remote --tags "$UPSTREAM_GIT" 'v6.18.*^{}' 'v6.18.*' 2>/dev/null \
+               || git ls-remote --tags "$UPSTREAM_GIT_ALT" 'v6.18.*^{}' 'v6.18.*' 2>/dev/null)
           best=$(printf '%s\n' "$pairs" \
             | awk '/\^\{\}$/ && $2 !~ /-rc/ { sub(/\^\{\}$/,"",$2); print $2 "\t" $1 }' \
             | sed 's|refs/tags/v||' \
