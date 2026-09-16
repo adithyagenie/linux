@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2024-2025 Intel Corporation
+ * Copyright (C) 2024-2026 Intel Corporation
  */
 
 #include "constants.h"
@@ -508,15 +508,15 @@ void iwl_mld_remove_link(struct iwl_mld *mld,
 	iwl_mld_rm_link_from_fw(mld, bss_conf);
 	/* Continue cleanup on failure */
 
-	if (!is_deflink)
-		kfree_rcu(link, rcu_head);
-
 	RCU_INIT_POINTER(mld_vif->link[bss_conf->link_id], NULL);
 
 	if (WARN_ON(link->fw_id >= mld->fw->ucode_capa.num_links))
 		return;
 
 	RCU_INIT_POINTER(mld->fw_id_to_bss_conf[link->fw_id], NULL);
+
+	if (!is_deflink)
+		kfree_rcu(link, rcu_head);
 }
 
 void iwl_mld_handle_missed_beacon_notif(struct iwl_mld *mld,
@@ -707,18 +707,13 @@ static int
 iwl_mld_get_chan_load_from_element(struct iwl_mld *mld,
 				   struct ieee80211_bss_conf *link_conf)
 {
-	struct ieee80211_vif *vif = link_conf->vif;
 	const struct cfg80211_bss_ies *ies;
 	const struct element *bss_load_elem = NULL;
 	const struct ieee80211_bss_load_elem *bss_load;
 
 	guard(rcu)();
 
-	if (ieee80211_vif_link_active(vif, link_conf->link_id))
-		ies = rcu_dereference(link_conf->bss->beacon_ies);
-	else
-		ies = rcu_dereference(link_conf->bss->ies);
-
+	ies = rcu_dereference(link_conf->bss->beacon_ies);
 	if (ies)
 		bss_load_elem = cfg80211_find_elem(WLAN_EID_QBSS_LOAD,
 						   ies->data, ies->len);

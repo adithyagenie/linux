@@ -117,7 +117,7 @@ xfs_buf_free(
 		vfree(bp->b_addr);
 	else if (bp->b_flags & _XBF_KMEM)
 		kfree(bp->b_addr);
-	else
+	else if (bp->b_addr)
 		folio_put(virt_to_folio(bp->b_addr));
 
 	call_rcu(&bp->b_rcu, xfs_buf_free_callback);
@@ -1751,7 +1751,7 @@ xfs_init_buftarg(
 	const char			*descr)
 {
 	/* The maximum size of the buftarg is only known once the sb is read. */
-	btp->bt_nr_sectors = (xfs_daddr_t)-1;
+	btp->bt_nr_sectors = XFS_BUF_DADDR_MAX;
 
 	/* Set up device logical sector size mask */
 	btp->bt_logical_sectorsize = logical_sectorsize;
@@ -1831,6 +1831,7 @@ xfs_alloc_buftarg(
 	return btp;
 
 error_free:
+	fs_put_dax(btp->bt_daxdev, mp);
 	kfree(btp);
 	return ERR_PTR(error);
 }

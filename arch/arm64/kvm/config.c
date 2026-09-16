@@ -5,6 +5,8 @@
  */
 
 #include <linux/kvm_host.h>
+#include <asm/kvm_emulate.h>
+#include <asm/kvm_nested.h>
 #include <asm/sysreg.h>
 
 /*
@@ -125,7 +127,6 @@ struct reg_feat_map_desc {
 	}
 
 #define FEAT_SPE		ID_AA64DFR0_EL1, PMSVer, IMP
-#define FEAT_SPE_FnE		ID_AA64DFR0_EL1, PMSVer, V1P2
 #define FEAT_BRBE		ID_AA64DFR0_EL1, BRBE, IMP
 #define FEAT_TRC_SR		ID_AA64DFR0_EL1, TraceVer, IMP
 #define FEAT_PMUv3		ID_AA64DFR0_EL1, PMUVer, IMP
@@ -186,7 +187,7 @@ struct reg_feat_map_desc {
 #define FEAT_SRMASK		ID_AA64MMFR4_EL1, SRMASK, IMP
 #define FEAT_PoPS		ID_AA64MMFR4_EL1, PoPS, IMP
 #define FEAT_PFAR		ID_AA64PFR1_EL1, PFAR, IMP
-#define FEAT_Debugv8p9		ID_AA64DFR0_EL1, PMUVer, V3P9
+#define FEAT_Debugv8p9		ID_AA64DFR0_EL1, DebugVer, V8P9
 #define FEAT_PMUv3_SS		ID_AA64DFR0_EL1, PMSS, IMP
 #define FEAT_SEBEP		ID_AA64DFR0_EL1, SEBEP, IMP
 #define FEAT_EBEP		ID_AA64DFR1_EL1, EBEP, IMP
@@ -290,6 +291,16 @@ static bool feat_spe_fds(struct kvm *kvm)
 	 */
 	return (kvm_has_feat(kvm, FEAT_SPEv1p4) &&
 		(read_sysreg_s(SYS_PMSIDR_EL1) & PMSIDR_EL1_FDS));
+}
+
+static bool feat_spe_fne(struct kvm *kvm)
+{
+	/*
+	 * Revisit this if KVM ever supports SPE -- this really should
+	 * look at the guest's view of PMSIDR_EL1.
+	 */
+	return (kvm_has_feat(kvm, FEAT_SPEv1p2) &&
+		(read_sysreg_s(SYS_PMSIDR_EL1) & PMSIDR_EL1_FnE));
 }
 
 static bool feat_trbe_mpam(struct kvm *kvm)
@@ -545,7 +556,7 @@ static const struct reg_bits_to_feat_map hdfgrtr_feat_map[] = {
 		   HDFGRTR_EL2_PMBPTR_EL1	|
 		   HDFGRTR_EL2_PMBLIMITR_EL1,
 		   FEAT_SPE),
-	NEEDS_FEAT(HDFGRTR_EL2_nPMSNEVFR_EL1, FEAT_SPE_FnE),
+	NEEDS_FEAT(HDFGRTR_EL2_nPMSNEVFR_EL1, feat_spe_fne),
 	NEEDS_FEAT(HDFGRTR_EL2_nBRBDATA		|
 		   HDFGRTR_EL2_nBRBCTL		|
 		   HDFGRTR_EL2_nBRBIDR,
@@ -613,7 +624,7 @@ static const struct reg_bits_to_feat_map hdfgwtr_feat_map[] = {
 		   HDFGWTR_EL2_PMBPTR_EL1	|
 		   HDFGWTR_EL2_PMBLIMITR_EL1,
 		   FEAT_SPE),
-	NEEDS_FEAT(HDFGWTR_EL2_nPMSNEVFR_EL1, FEAT_SPE_FnE),
+	NEEDS_FEAT(HDFGWTR_EL2_nPMSNEVFR_EL1, feat_spe_fne),
 	NEEDS_FEAT(HDFGWTR_EL2_nBRBDATA		|
 		   HDFGWTR_EL2_nBRBCTL,
 		   FEAT_BRBE),
@@ -1427,4 +1438,92 @@ void get_reg_fixed_bits(struct kvm *kvm, enum vcpu_sysreg reg, u64 *res0, u64 *r
 		*res0 = *res1 = 0;
 		break;
 	}
+}
+
+static __always_inline struct fgt_masks *__fgt_reg_to_masks(enum vcpu_sysreg reg)
+{
+	switch (reg) {
+	case HFGRTR_EL2:
+		return &hfgrtr_masks;
+	case HFGWTR_EL2:
+		return &hfgwtr_masks;
+	case HFGITR_EL2:
+		return &hfgitr_masks;
+	case HDFGRTR_EL2:
+		return &hdfgrtr_masks;
+	case HDFGWTR_EL2:
+		return &hdfgwtr_masks;
+	case HAFGRTR_EL2:
+		return &hafgrtr_masks;
+	case HFGRTR2_EL2:
+		return &hfgrtr2_masks;
+	case HFGWTR2_EL2:
+		return &hfgwtr2_masks;
+	case HFGITR2_EL2:
+		return &hfgitr2_masks;
+	case HDFGRTR2_EL2:
+		return &hdfgrtr2_masks;
+	case HDFGWTR2_EL2:
+		return &hdfgwtr2_masks;
+	default:
+		BUILD_BUG_ON(1);
+	}
+}
+
+static __always_inline void __compute_fgt(struct kvm_vcpu *vcpu, enum vcpu_sysreg reg)
+{
+	u64 fgu = vcpu->kvm->arch.fgu[__fgt_reg_to_group_id(reg)];
+	struct fgt_masks *m = __fgt_reg_to_masks(reg);
+	u64 clear = 0, set = 0, val = m->nmask;
+
+	set |= fgu & m->mask;
+	clear |= fgu & m->nmask;
+
+	if (is_nested_ctxt(vcpu)) {
+		u64 nested = __vcpu_sys_reg(vcpu, reg);
+		set |= nested & m->mask;
+		clear |= ~nested & m->nmask;
+	}
+
+	val |= set;
+	val &= ~clear;
+	*vcpu_fgt(vcpu, reg) = val;
+}
+
+static void __compute_hfgwtr(struct kvm_vcpu *vcpu)
+{
+	__compute_fgt(vcpu, HFGWTR_EL2);
+
+	if (cpus_have_final_cap(ARM64_WORKAROUND_AMPERE_AC03_CPU_38))
+		*vcpu_fgt(vcpu, HFGWTR_EL2) |= HFGWTR_EL2_TCR_EL1;
+}
+
+static void __compute_hdfgwtr(struct kvm_vcpu *vcpu)
+{
+	__compute_fgt(vcpu, HDFGWTR_EL2);
+
+	if (is_hyp_ctxt(vcpu))
+		*vcpu_fgt(vcpu, HDFGWTR_EL2) |= HDFGWTR_EL2_MDSCR_EL1;
+}
+
+void kvm_vcpu_load_fgt(struct kvm_vcpu *vcpu)
+{
+	if (!cpus_have_final_cap(ARM64_HAS_FGT))
+		return;
+
+	__compute_fgt(vcpu, HFGRTR_EL2);
+	__compute_hfgwtr(vcpu);
+	__compute_fgt(vcpu, HFGITR_EL2);
+	__compute_fgt(vcpu, HDFGRTR_EL2);
+	__compute_hdfgwtr(vcpu);
+	__compute_fgt(vcpu, HAFGRTR_EL2);
+
+	if (!cpus_have_final_cap(ARM64_HAS_FGT2))
+		return;
+
+	__compute_fgt(vcpu, HFGRTR2_EL2);
+	__compute_fgt(vcpu, HFGWTR2_EL2);
+	__compute_fgt(vcpu, HFGITR2_EL2);
+	__compute_fgt(vcpu, HDFGRTR2_EL2);
+	__compute_fgt(vcpu, HDFGWTR2_EL2);
 }

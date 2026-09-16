@@ -300,8 +300,8 @@ static const struct mfd_cell exynos_pmu_devs[] = {
  */
 struct regmap *exynos_get_pmu_regmap(void)
 {
-	struct device_node *np = of_find_matching_node(NULL,
-						      exynos_pmu_of_device_ids);
+	struct device_node *np __free(device_node) =
+		of_find_matching_node(NULL, exynos_pmu_of_device_ids);
 	if (np)
 		return exynos_get_pmu_regmap_by_phandle(np, NULL);
 	return ERR_PTR(-ENODEV);
@@ -345,6 +345,8 @@ struct regmap *exynos_get_pmu_regmap_by_phandle(struct device_node *np,
 
 	if (!dev)
 		return ERR_PTR(-EPROBE_DEFER);
+
+	put_device(dev);
 
 	return syscon_node_to_regmap(pmu_np);
 }
@@ -585,10 +587,6 @@ static int setup_cpuhp_and_cpuidle(struct device *dev)
 	if (!pmu_context->in_cpuhp)
 		return -ENOMEM;
 
-	raw_spin_lock_init(&pmu_context->cpupm_lock);
-	pmu_context->sys_inreboot = false;
-	pmu_context->sys_insuspend = false;
-
 	/* set PMU to power on */
 	for_each_online_cpu(cpu)
 		gs101_cpuhp_pmu_online(cpu);
@@ -657,6 +655,9 @@ static int exynos_pmu_probe(struct platform_device *pdev)
 
 	pmu_context->pmureg = regmap;
 	pmu_context->dev = dev;
+	raw_spin_lock_init(&pmu_context->cpupm_lock);
+	pmu_context->sys_inreboot = false;
+	pmu_context->sys_insuspend = false;
 
 	if (pmu_context->pmu_data && pmu_context->pmu_data->pmu_cpuhp) {
 		ret = setup_cpuhp_and_cpuidle(dev);

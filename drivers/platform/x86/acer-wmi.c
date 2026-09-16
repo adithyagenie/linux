@@ -102,6 +102,7 @@ MODULE_ALIAS("wmi:676AA15E-6A47-4D9F-A2CC-1E6D18D14026");
 
 enum acer_wmi_event_ids {
 	WMID_HOTKEY_EVENT = 0x1,
+	WMID_BACKLIGHT_EVENT = 0x4,
 	WMID_ACCEL_OR_KBD_DOCK_EVENT = 0x5,
 	WMID_GAMING_TURBO_KEY_EVENT = 0x7,
 	WMID_AC_EVENT = 0x8,
@@ -1529,7 +1530,9 @@ static int WMI_gaming_execute_u32_u64(u32 method_id, u32 in, u64 *out)
 		return -EIO;
 
 	obj = result.pointer;
-	if (obj && out) {
+	if (!obj && out) {
+		ret = -ENOMSG;
+	} else if (obj && out) {
 		switch (obj->type) {
 		case ACPI_TYPE_INTEGER:
 			*out = obj->integer.value;
@@ -2368,6 +2371,9 @@ static void acer_wmi_notify(union acpi_object *obj, void *context)
 			}
 			sparse_keymap_report_event(acer_wmi_input_dev, scancode, 1, true);
 		}
+		break;
+	case WMID_BACKLIGHT_EVENT:
+		/* Already handled by acpi-video */
 		break;
 	case WMID_ACCEL_OR_KBD_DOCK_EVENT:
 		acer_gsensor_event();

@@ -1446,13 +1446,14 @@ static int gmac_clk_enable(struct rk_priv_data *bsp_priv, bool enable)
 		}
 	} else {
 		if (bsp_priv->clk_enabled) {
+			if (bsp_priv->ops && bsp_priv->ops->set_clock_selection) {
+				bsp_priv->ops->set_clock_selection(bsp_priv,
+					      bsp_priv->clock_input, false);
+			}
+
 			clk_bulk_disable_unprepare(bsp_priv->num_clks,
 						   bsp_priv->clks);
 			clk_disable_unprepare(bsp_priv->clk_phy);
-
-			if (bsp_priv->ops && bsp_priv->ops->set_clock_selection)
-				bsp_priv->ops->set_clock_selection(bsp_priv,
-					      bsp_priv->clock_input, false);
 
 			bsp_priv->clk_enabled = false;
 		}
@@ -1750,8 +1751,8 @@ static int rk_gmac_probe(struct platform_device *pdev)
 	/* If the stmmac is not already selected as gmac4,
 	 * then make sure we fallback to gmac.
 	 */
-	if (!plat_dat->has_gmac4) {
-		plat_dat->has_gmac = true;
+	if (plat_dat->core_type != DWMAC_CORE_GMAC4) {
+		plat_dat->core_type = DWMAC_CORE_GMAC;
 		plat_dat->rx_fifo_size = 4096;
 		plat_dat->tx_fifo_size = 2048;
 	}
