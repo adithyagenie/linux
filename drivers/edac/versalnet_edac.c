@@ -433,7 +433,7 @@ static void handle_error(struct mc_priv  *priv, struct ecc_status *stat,
 	phys_addr_t pfn;
 	int err;
 
-	if (WARN_ON_ONCE(ctl_num > NUM_CONTROLLERS))
+	if (WARN_ON_ONCE(ctl_num >= NUM_CONTROLLERS))
 		return;
 
 	mci = priv->mci[ctl_num];
@@ -605,21 +605,23 @@ static int rpmsg_cb(struct rpmsg_device *rpdev, void *data,
 	length = result[MSG_ERR_LENGTH];
 	offset = result[MSG_ERR_OFFSET];
 
+	/*
+	 * The data can come in two stretches. Construct the regs from two
+	 * messages. The offset indicates the offset from which the data is to
+	 * be taken.
+	 */
+	for (i = 0 ; i < length; i++) {
+		k = offset + i;
+		j = ERROR_DATA + i;
+		mc_priv->regs[k] = result[j];
+	}
+
 	if (result[TOTAL_ERR_LENGTH] > length) {
 		if (!mc_priv->part_len)
 			mc_priv->part_len = length;
 		else
 			mc_priv->part_len += length;
-		/*
-		 * The data can come in 2 stretches. Construct the regs from 2
-		 * messages the offset indicates the offset from which the data is to
-		 * be taken
-		 */
-		for (i = 0 ; i < length; i++) {
-			k = offset + i;
-			j = ERROR_DATA + i;
-			mc_priv->regs[k] = result[j];
-		}
+
 		if (mc_priv->part_len < result[TOTAL_ERR_LENGTH])
 			return 0;
 		mc_priv->part_len = 0;
@@ -705,7 +707,7 @@ static int rpmsg_cb(struct rpmsg_device *rpdev, void *data,
 	/* Convert to bytes */
 	length = result[TOTAL_ERR_LENGTH] * 4;
 	log_non_standard_event(sec_type, &amd_versalnet_guid, mc_priv->message,
-			       sec_sev, (void *)&result[ERROR_DATA], length);
+			       sec_sev, (void *)&mc_priv->regs, length);
 
 	return 0;
 }
@@ -763,9 +765,9 @@ static int init_versalnet(struct mc_priv *priv, struct platform_device *pdev)
 	u32 num_chans, rank, dwidth, config;
 	struct edac_mc_layer layers[2];
 	struct mem_ctl_info *mci;
+	char name[32];
 	struct device *dev;
 	enum dev_type dt;
-	char *name;
 	int rc, i;
 
 	for (i = 0; i < NUM_CONTROLLERS; i++) {
@@ -812,7 +814,6 @@ static int init_versalnet(struct mc_priv *priv, struct platform_device *pdev)
 
 		dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 		dev->release = versal_edac_release;
-		name = kmalloc(32, GFP_KERNEL);
 		sprintf(name, "versal-net-ddrmc5-edac-%d", i);
 		dev->init_name = name;
 		rc = device_register(dev);
@@ -866,12 +867,12 @@ static void remove_versalnet(struct mc_priv *priv)
 
 static int mc_probe(struct platform_device *pdev)
 {
-	struct device_node *r5_core_node;
 	struct mc_priv *priv;
 	struct rproc *rp;
 	int rc;
 
-	r5_core_node = of_parse_phandle(pdev->dev.of_node, "amd,rproc", 0);
+	struct device_node *r5_core_node __free(device_node) =
+		of_parse_phandle(pdev->dev.of_node, "amd,rproc", 0);
 	if (!r5_core_node) {
 		dev_err(&pdev->dev, "amd,rproc: invalid phandle\n");
 		return -EINVAL;
@@ -915,6 +916,7 @@ static int mc_probe(struct platform_device *pdev)
 
 err_init:
 	cdx_mcdi_finish(priv->mcdi);
+	kfree(priv->mcdi);
 
 err_unreg:
 	unregister_rpmsg_driver(&amd_rpmsg_driver);
@@ -936,6 +938,7 @@ static void mc_remove(struct platform_device *pdev)
 	remove_versalnet(priv);
 	rproc_shutdown(priv->mcdi->r5_rproc);
 	cdx_mcdi_finish(priv->mcdi);
+	kfree(priv->mcdi);
 }
 
 static const struct of_device_id amd_edac_match[] = {

@@ -86,7 +86,7 @@ int hid_haptic_input_configured(struct hid_device *hdev,
 	if (hi->application == HID_DG_TOUCHPAD) {
 		if (haptic->auto_trigger_report &&
 		    haptic->manual_trigger_report) {
-			__set_bit(INPUT_PROP_HAPTIC_TOUCHPAD, hi->input->propbit);
+			__set_bit(INPUT_PROP_PRESSUREPAD, hi->input->propbit);
 			return 1;
 		}
 		return 0;
@@ -187,7 +187,7 @@ static void fill_effect_buf(struct hid_haptic_device *haptic,
 				value = waveform_ordinal;
 				break;
 			default:
-				break;
+				continue;
 			}
 
 			field->value[j] = value;

@@ -39,33 +39,12 @@ static unsigned long systable_ptr;
 static unsigned long start_addr;
 static unsigned long first_ind_entry;
 
-static void kexec_image_info(const struct kimage *kimage)
-{
-	unsigned long i;
-
-	pr_debug("kexec kimage info:\n");
-	pr_debug("\ttype:        %d\n", kimage->type);
-	pr_debug("\tstart:       %lx\n", kimage->start);
-	pr_debug("\thead:        %lx\n", kimage->head);
-	pr_debug("\tnr_segments: %lu\n", kimage->nr_segments);
-
-	for (i = 0; i < kimage->nr_segments; i++) {
-		pr_debug("\t    segment[%lu]: %016lx - %016lx", i,
-			kimage->segment[i].mem,
-			kimage->segment[i].mem + kimage->segment[i].memsz);
-		pr_debug("\t\t0x%lx bytes, %lu pages\n",
-			(unsigned long)kimage->segment[i].memsz,
-			(unsigned long)kimage->segment[i].memsz /  PAGE_SIZE);
-	}
-}
-
 int machine_kexec_prepare(struct kimage *kimage)
 {
 	int i;
+	char head[8];
 	char *bootloader = "kexec";
 	void *cmdline_ptr = (void *)KEXEC_CMDLINE_ADDR;
-
-	kexec_image_info(kimage);
 
 	kimage->arch.efi_boot = fw_arg0;
 	kimage->arch.systable_ptr = fw_arg2;
@@ -81,7 +60,9 @@ int machine_kexec_prepare(struct kimage *kimage)
 	} else {
 		/* Find the command line */
 		for (i = 0; i < kimage->nr_segments; i++) {
-			if (!strncmp(bootloader, (char __user *)kimage->segment[i].buf, strlen(bootloader))) {
+			if (copy_from_user(head, kimage->segment[i].buf, strlen(bootloader)))
+				continue;
+			if (!strncmp(bootloader, head, strlen(bootloader))) {
 				if (!copy_from_user(cmdline_ptr, kimage->segment[i].buf, COMMAND_LINE_SIZE))
 					kimage->arch.cmdline_ptr = (unsigned long)cmdline_ptr;
 				break;
@@ -259,6 +240,7 @@ void machine_crash_shutdown(struct pt_regs *regs)
 #ifdef CONFIG_SMP
 	crash_smp_send_stop();
 #endif
+	machine_kexec_mask_interrupts();
 	cpumask_set_cpu(crashing_cpu, &cpus_in_crash);
 
 	pr_info("Starting crashdump kernel...\n");
@@ -296,6 +278,7 @@ void machine_kexec(struct kimage *image)
 
 	/* We do not want to be bothered. */
 	local_irq_disable();
+	machine_kexec_mask_interrupts();
 
 	pr_notice("EFI boot flag: 0x%lx\n", efi_boot);
 	pr_notice("Command line addr: 0x%lx\n", cmdline_ptr);

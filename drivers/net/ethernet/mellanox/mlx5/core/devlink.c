@@ -107,9 +107,7 @@ mlx5_devlink_info_get(struct devlink *devlink, struct devlink_info_req *req,
 	if (err)
 		return err;
 
-	err = mlx5_fw_version_query(dev, &running_fw, &stored_fw);
-	if (err)
-		return err;
+	mlx5_fw_version_query(dev, &running_fw, &stored_fw);
 
 	snprintf(version_str, sizeof(version_str), "%d.%d.%04d",
 		 mlx5_fw_ver_major(running_fw), mlx5_fw_ver_minor(running_fw),
@@ -196,6 +194,11 @@ static int mlx5_devlink_reload_down(struct devlink *devlink, bool netns_change,
 	struct mlx5_core_dev *dev = devlink_priv(devlink);
 	struct pci_dev *pdev = dev->pdev;
 	int ret = 0;
+
+	if (mlx5_fw_reset_in_progress(dev)) {
+		NL_SET_ERR_MSG_MOD(extack, "Can't reload during firmware reset");
+		return -EBUSY;
+	}
 
 	if (mlx5_dev_is_lightweight(dev)) {
 		if (action != DEVLINK_RELOAD_ACTION_DRIVER_REINIT)
@@ -541,7 +544,7 @@ static int mlx5_devlink_num_doorbells_validate(struct devlink *devlink, u32 id,
 	max_num_channels = mlx5e_get_max_num_channels(mdev);
 	if (val32 > max_num_channels) {
 		NL_SET_ERR_MSG_FMT_MOD(extack,
-				       "Requested num_doorbells (%u) exceeds maximum number of channels (%u)",
+				       "Requested num_doorbells (%u) exceeds max number of channels (%u)",
 				       val32, max_num_channels);
 		return -EINVAL;
 	}
