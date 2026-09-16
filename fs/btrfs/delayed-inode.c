@@ -1140,8 +1140,8 @@ __btrfs_commit_inode_delayed_items(struct btrfs_trans_handle *trans,
 	ret = btrfs_record_root_in_trans(trans, node->root);
 	if (ret)
 		return ret;
-	ret = btrfs_update_delayed_inode(trans, node->root, path, node);
-	return ret;
+
+	return btrfs_update_delayed_inode(trans, node->root, path, node);
 }
 
 /*
@@ -1676,7 +1676,7 @@ int btrfs_delete_delayed_dir_index(struct btrfs_trans_handle *trans,
 	if (unlikely(ret)) {
 		btrfs_err(trans->fs_info,
 "failed to add delayed dir index item, root: %llu, inode: %llu, index: %llu, error: %d",
-			  index, btrfs_root_id(node->root), node->inode_id, ret);
+			  btrfs_root_id(node->root), node->inode_id, index, ret);
 		btrfs_delayed_item_release_metadata(dir->root, item);
 		btrfs_release_delayed_item(item);
 	}

@@ -665,6 +665,13 @@ struct amdgpu_display_manager {
 	void *bb_from_dmub;
 
 	/**
+	 * @i2c_devres_group:
+	 *
+	 * Devres group for DM i2c adapter lifetime management.
+	 */
+	void *i2c_devres_group;
+
+	/**
 	 * @oem_i2c:
 	 *
 	 * OEM i2c bus
@@ -965,6 +972,7 @@ struct dm_crtc_state {
 
 	bool freesync_vrr_info_changed;
 
+	bool mode_changed_independent_from_dsc;
 	bool dsc_force_changed;
 	bool vrr_supported;
 	struct mod_freesync_config freesync_config;
