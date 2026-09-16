@@ -20,6 +20,7 @@
 #include <linux/falloc.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/kdev_t.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
 #include <linux/list.h>
@@ -909,21 +910,31 @@ jump_up:
 				break;
 			}
 		}
+
 		if (unlikely(IS_ROOT(walker_path.dentry))) {
-			/*
-			 * Stops at disconnected root directories.  Only allows
-			 * access to internal filesystems (e.g. nsfs, which is
-			 * reachable through /proc/<pid>/ns/<namespace>).
-			 */
-			if (walker_path.mnt->mnt_flags & MNT_INTERNAL) {
+			if (likely(walker_path.mnt->mnt_flags & MNT_INTERNAL)) {
+				/*
+				 * Stops and allows access when reaching disconnected root
+				 * directories that are part of internal filesystems (e.g. nsfs,
+				 * which is reachable through /proc/<pid>/ns/<namespace>).
+				 */
 				allowed_parent1 = true;
 				allowed_parent2 = true;
+				break;
 			}
-			break;
+
+			/*
+			 * We reached a disconnected root directory from a bind mount.
+			 * Let's continue the walk with the mount point we missed.
+			 */
+			dput(walker_path.dentry);
+			walker_path.dentry = walker_path.mnt->mnt_root;
+			dget(walker_path.dentry);
+		} else {
+			parent_dentry = dget_parent(walker_path.dentry);
+			dput(walker_path.dentry);
+			walker_path.dentry = parent_dentry;
 		}
-		parent_dentry = dget_parent(walker_path.dentry);
-		dput(walker_path.dentry);
-		walker_path.dentry = parent_dentry;
 	}
 	path_put(&walker_path);
 
@@ -975,7 +986,8 @@ static int current_check_access_path(const struct path *const path,
 	return -EACCES;
 }
 
-static __attribute_const__ access_mask_t get_mode_access(const umode_t mode)
+static __attribute_const__ access_mask_t get_mode_access(const umode_t mode,
+							 const dev_t dev)
 {
 	switch (mode & S_IFMT) {
 	case S_IFLNK:
@@ -983,6 +995,9 @@ static __attribute_const__ access_mask_t get_mode_access(const umode_t mode)
 	case S_IFDIR:
 		return LANDLOCK_ACCESS_FS_MAKE_DIR;
 	case S_IFCHR:
+		/* Whiteout objects are guarded with MAKE_REG. */
+		if (dev == WHITEOUT_DEV)
+			return LANDLOCK_ACCESS_FS_MAKE_REG;
 		return LANDLOCK_ACCESS_FS_MAKE_CHAR;
 	case S_IFBLK:
 		return LANDLOCK_ACCESS_FS_MAKE_BLOCK;
@@ -997,6 +1012,13 @@ static __attribute_const__ access_mask_t get_mode_access(const umode_t mode)
 		/* Treats weird files as regular files. */
 		return LANDLOCK_ACCESS_FS_MAKE_REG;
 	}
+}
+
+static access_mask_t get_dentry_access(const struct dentry *const dentry)
+{
+	const struct inode *const inode = d_backing_inode(dentry);
+
+	return get_mode_access(inode->i_mode, inode->i_rdev);
 }
 
 static access_mask_t maybe_remove(const struct dentry *const dentry)
@@ -1020,6 +1042,9 @@ static access_mask_t maybe_remove(const struct dentry *const dentry)
  * ancestor between the source and the destination of a renamed and linked
  * file.  While walking from @dir to @mnt_root, we record all the domain's
  * allowed accesses in @layer_masks_dom.
+ *
+ * Because of disconnected directories, this walk may not reach @mnt_dir.  In
+ * this case, the walk will continue to @mnt_dir after this call.
  *
  * This is similar to is_access_to_paths_allowed() but much simpler because it
  * only handles walking on the same mount point and only checks one set of
@@ -1062,8 +1087,11 @@ static bool collect_domain_accesses(
 			break;
 		}
 
-		/* We should not reach a root other than @mnt_root. */
-		if (dir == mnt_root || WARN_ON_ONCE(IS_ROOT(dir)))
+		/*
+		 * Stops at the mount point or the filesystem root for a disconnected
+		 * directory.
+		 */
+		if (dir == mnt_root || unlikely(IS_ROOT(dir)))
 			break;
 
 		parent_dentry = dget_parent(dir);
@@ -1082,6 +1110,7 @@ static bool collect_domain_accesses(
  * @new_dentry: Destination file or directory.
  * @removable: Sets to true if it is a rename operation.
  * @exchange: Sets to true if it is a rename operation with RENAME_EXCHANGE.
+ * @whiteout: Sets to true if it is a rename operation with RENAME_WHITEOUT.
  *
  * Because of its unprivileged constraints, Landlock relies on file hierarchies
  * (and not only inodes) to tie access rights to files.  Being able to link or
@@ -1130,7 +1159,8 @@ static bool collect_domain_accesses(
 static int current_check_refer_path(struct dentry *const old_dentry,
 				    const struct path *const new_dir,
 				    struct dentry *const new_dentry,
-				    const bool removable, const bool exchange)
+				    const bool removable, const bool exchange,
+				    const bool whiteout)
 {
 	const struct landlock_cred_security *const subject =
 		landlock_get_applicable_subject(current_cred(), any_fs, NULL);
@@ -1150,17 +1180,24 @@ static int current_check_refer_path(struct dentry *const old_dentry,
 	if (exchange) {
 		if (unlikely(d_is_negative(new_dentry)))
 			return -ENOENT;
-		access_request_parent1 =
-			get_mode_access(d_backing_inode(new_dentry)->i_mode);
+		access_request_parent1 = get_dentry_access(new_dentry);
 	} else {
 		access_request_parent1 = 0;
 	}
-	access_request_parent2 =
-		get_mode_access(d_backing_inode(old_dentry)->i_mode);
+	access_request_parent2 = get_dentry_access(old_dentry);
 	if (removable) {
 		access_request_parent1 |= maybe_remove(old_dentry);
 		access_request_parent2 |= maybe_remove(new_dentry);
 	}
+
+	/*
+	 * In case of renameat2(2) with RENAME_WHITEOUT, a whiteout object is
+	 * created in the source location, so we require an additional access
+	 * right there.
+	 */
+	if (whiteout)
+		access_request_parent1 |=
+			get_mode_access(S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
 
 	/* The mount points are the same for old and new paths, cf. EXDEV. */
 	if (old_dentry->d_parent == new_dir->dentry) {
@@ -1335,11 +1372,10 @@ static void hook_sb_delete(struct super_block *const sb)
 			 * At this point, we own the ihold() reference that was
 			 * originally set up by get_inode_object() and the
 			 * __iget() reference that we just set in this loop
-			 * walk.  Therefore the following call to iput() will
-			 * not sleep nor drop the inode because there is now at
-			 * least two references to it.
+			 * walk.  Therefore there are at least two references
+			 * on the inode.
 			 */
-			iput(inode);
+			iput_not_last(inode);
 		} else {
 			spin_unlock(&object->lock);
 			rcu_read_unlock();
@@ -1512,7 +1548,7 @@ static int hook_path_link(struct dentry *const old_dentry,
 			  struct dentry *const new_dentry)
 {
 	return current_check_refer_path(old_dentry, new_dir, new_dentry, false,
-					false);
+					false, false);
 }
 
 static int hook_path_rename(const struct path *const old_dir,
@@ -1523,7 +1559,8 @@ static int hook_path_rename(const struct path *const old_dir,
 {
 	/* old_dir refers to old_dentry->d_parent and new_dir->mnt */
 	return current_check_refer_path(old_dentry, new_dir, new_dentry, true,
-					!!(flags & RENAME_EXCHANGE));
+					!!(flags & RENAME_EXCHANGE),
+					!!(flags & RENAME_WHITEOUT));
 }
 
 static int hook_path_mkdir(const struct path *const dir,
@@ -1536,7 +1573,8 @@ static int hook_path_mknod(const struct path *const dir,
 			   struct dentry *const dentry, const umode_t mode,
 			   const unsigned int dev)
 {
-	return current_check_access_path(dir, get_mode_access(mode));
+	return current_check_access_path(
+		dir, get_mode_access(mode, new_decode_dev(dev)));
 }
 
 static int hook_path_symlink(const struct path *const dir,
@@ -1784,6 +1822,14 @@ static bool control_current_fowner(struct fown_struct *const fown)
 	lockdep_assert_held(&fown->lock);
 
 	/*
+	 * A process-group or session owner (PIDTYPE_PGID/PIDTYPE_SID) fans the
+	 * signal out to every member at delivery time, so record the domain and
+	 * let hook_file_send_sigiotask() check the live scope per recipient.
+	 */
+	if (fown->pid_type != PIDTYPE_PID && fown->pid_type != PIDTYPE_TGID)
+		return true;
+
+	/*
 	 * Some callers (e.g. fcntl_dirnotify) may not be in an RCU read-side
 	 * critical section.
 	 */
@@ -1799,6 +1845,7 @@ static void hook_file_set_fowner(struct file *file)
 {
 	struct landlock_ruleset *prev_dom;
 	struct landlock_cred_security fown_subject = {};
+	struct pid *prev_tg, *fown_tg = NULL;
 	size_t fown_layer = 0;
 
 	if (control_current_fowner(file_f_owner(file))) {
@@ -1811,21 +1858,26 @@ static void hook_file_set_fowner(struct file *file)
 		if (new_subject) {
 			landlock_get_ruleset(new_subject->domain);
 			fown_subject = *new_subject;
+			fown_tg = get_pid(task_tgid(current));
 		}
 	}
 
 	prev_dom = landlock_file(file)->fown_subject.domain;
+	prev_tg = landlock_file(file)->fown_tg;
 	landlock_file(file)->fown_subject = fown_subject;
+	landlock_file(file)->fown_tg = fown_tg;
 #ifdef CONFIG_AUDIT
 	landlock_file(file)->fown_layer = fown_layer;
 #endif /* CONFIG_AUDIT*/
 
 	/* May be called in an RCU read-side critical section. */
 	landlock_put_ruleset_deferred(prev_dom);
+	put_pid(prev_tg);
 }
 
 static void hook_file_free_security(struct file *file)
 {
+	put_pid(landlock_file(file)->fown_tg);
 	landlock_put_ruleset_deferred(landlock_file(file)->fown_subject.domain);
 }
 

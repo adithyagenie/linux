@@ -82,13 +82,13 @@
  * mixer and output but a different set for device.
  */
 struct s1810c_ctl_packet {
-	u32 a;
-	u32 b;
-	u32 fixed1;
-	u32 fixed2;
-	u32 c;
-	u32 d;
-	u32 e;
+	__le32 a;
+	__le32 b;
+	__le32 fixed1;
+	__le32 fixed2;
+	__le32 c;
+	__le32 d;
+	__le32 e;
 };
 
 #define SC1810C_CTL_LINE_SW	0
@@ -118,7 +118,7 @@ struct s1810c_ctl_packet {
  * being zero and different f1/f2.
  */
 struct s1810c_state_packet {
-	u32 fields[63];
+	__le32 fields[63];
 };
 
 #define SC1810C_STATE_48V_SW	58
@@ -140,14 +140,14 @@ snd_s1810c_send_ctl_packet(struct usb_device *dev, u32 a,
 	struct s1810c_ctl_packet pkt = { 0 };
 	int ret = 0;
 
-	pkt.fixed1 = SC1810C_CMD_F1;
-	pkt.fixed2 = SC1810C_CMD_F2;
+	pkt.fixed1 = __cpu_to_le32(SC1810C_CMD_F1);
+	pkt.fixed2 = __cpu_to_le32(SC1810C_CMD_F2);
 
-	pkt.a = a;
-	pkt.b = b;
-	pkt.c = c;
-	pkt.d = d;
-	pkt.e = e;
+	pkt.a = __cpu_to_le32(a);
+	pkt.b = __cpu_to_le32(b);
+	pkt.c = __cpu_to_le32(c);
+	pkt.d = __cpu_to_le32(d);
+	pkt.e = __cpu_to_le32(e);
 
 	ret = snd_usb_ctl_msg(dev, usb_sndctrlpipe(dev, 0),
 			      SC1810C_CMD_REQ,
@@ -176,9 +176,9 @@ snd_sc1810c_get_status_field(struct usb_device *dev,
 	struct s1810c_state_packet pkt_in = { { 0 } };
 	int ret = 0;
 
-	pkt_out.fields[SC1810C_STATE_F1_IDX] = SC1810C_SET_STATE_F1;
-	pkt_out.fields[SC1810C_STATE_F2_IDX] = SC1810C_SET_STATE_F2;
-	ret = snd_usb_ctl_msg(dev, usb_rcvctrlpipe(dev, 0),
+	pkt_out.fields[SC1810C_STATE_F1_IDX] = __cpu_to_le32(SC1810C_SET_STATE_F1);
+	pkt_out.fields[SC1810C_STATE_F2_IDX] = __cpu_to_le32(SC1810C_SET_STATE_F2);
+	ret = snd_usb_ctl_msg(dev, usb_sndctrlpipe(dev, 0),
 			      SC1810C_SET_STATE_REQ,
 			      SC1810C_SET_STATE_REQTYPE,
 			      (*seqnum), 0, &pkt_out, sizeof(pkt_out));
@@ -197,7 +197,7 @@ snd_sc1810c_get_status_field(struct usb_device *dev,
 		return ret;
 	}
 
-	(*field) = pkt_in.fields[field_idx];
+	(*field) = __le32_to_cpu(pkt_in.fields[field_idx]);
 	(*seqnum)++;
 	return 0;
 }
@@ -597,15 +597,6 @@ int snd_sc1810_init_mixer(struct usb_mixer_interface *mixer)
 	if (!list_empty(&chip->mixer_list))
 		return 0;
 
-	dev_info(&dev->dev,
-		 "Presonus Studio 1810c, device_setup: %u\n", chip->setup);
-	if (chip->setup == 1)
-		dev_info(&dev->dev, "(8out/18in @ 48kHz)\n");
-	else if (chip->setup == 2)
-		dev_info(&dev->dev, "(6out/8in @ 192kHz)\n");
-	else
-		dev_info(&dev->dev, "(8out/14in @ 96kHz)\n");
-
 	ret = snd_s1810c_init_mixer_maps(chip);
 	if (ret < 0)
 		return ret;
@@ -634,16 +625,28 @@ int snd_sc1810_init_mixer(struct usb_mixer_interface *mixer)
 	if (ret < 0)
 		return ret;
 
-	// The 1824c has a Mono Main switch instead of a
-	// A/B select switch.
-	if (mixer->chip->usb_id == USB_ID(0x194f, 0x010d)) {
-		ret = snd_s1810c_switch_init(mixer, &snd_s1824c_mono_sw);
-		if (ret < 0)
-			return ret;
-	} else if (mixer->chip->usb_id == USB_ID(0x194f, 0x010c)) {
+	switch (chip->usb_id) {
+	case USB_ID(0x194f, 0x010c): /* Presonus Studio 1810c */
+		dev_info(&dev->dev,
+			 "Presonus Studio 1810c, device_setup: %u\n", chip->setup);
+		if (chip->setup == 1)
+			dev_info(&dev->dev, "(8out/18in @ 48kHz)\n");
+		else if (chip->setup == 2)
+			dev_info(&dev->dev, "(6out/8in @ 192kHz)\n");
+		else
+			dev_info(&dev->dev, "(8out/14in @ 96kHz)\n");
+
 		ret = snd_s1810c_switch_init(mixer, &snd_s1810c_ab_sw);
 		if (ret < 0)
 			return ret;
+
+		break;
+	case USB_ID(0x194f, 0x010d): /* Presonus Studio 1824c */
+		ret = snd_s1810c_switch_init(mixer, &snd_s1824c_mono_sw);
+		if (ret < 0)
+			return ret;
+
+		break;
 	}
 
 	return ret;
