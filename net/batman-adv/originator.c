@@ -763,9 +763,14 @@ int batadv_hardif_neigh_dump(struct sk_buff *msg, struct netlink_callback *cb)
 	bat_priv = netdev_priv(mesh_iface);
 
 	primary_if = batadv_primary_if_get_selected(bat_priv);
-	if (!primary_if || primary_if->if_status != BATADV_IF_ACTIVE) {
+	if (!primary_if) {
 		ret = -ENOENT;
 		goto out_put_mesh_iface;
+	}
+
+	if (primary_if->if_status != BATADV_IF_ACTIVE) {
+		ret = -ENOENT;
+		goto out_put_primary_if;
 	}
 
 	hard_iface = batadv_netlink_get_hardif(bat_priv, cb);
@@ -830,8 +835,6 @@ static void batadv_orig_node_free_rcu(struct rcu_head *rcu)
 
 	orig_node = container_of(rcu, struct batadv_orig_node, rcu);
 
-	batadv_mcast_purge_orig(orig_node);
-
 	batadv_frag_purge_orig(orig_node, NULL);
 
 	kfree(orig_node->tt_buff);
@@ -881,6 +884,8 @@ void batadv_orig_node_release(struct kref *ref)
 		batadv_orig_node_vlan_put(vlan);
 	}
 	spin_unlock_bh(&orig_node->vlan_list_lock);
+
+	batadv_mcast_purge_orig(orig_node);
 
 	call_rcu(&orig_node->rcu, batadv_orig_node_free_rcu);
 }
@@ -1327,9 +1332,14 @@ int batadv_orig_dump(struct sk_buff *msg, struct netlink_callback *cb)
 	bat_priv = netdev_priv(mesh_iface);
 
 	primary_if = batadv_primary_if_get_selected(bat_priv);
-	if (!primary_if || primary_if->if_status != BATADV_IF_ACTIVE) {
+	if (!primary_if) {
 		ret = -ENOENT;
 		goto out_put_mesh_iface;
+	}
+
+	if (primary_if->if_status != BATADV_IF_ACTIVE) {
+		ret = -ENOENT;
+		goto out_put_primary_if;
 	}
 
 	hard_iface = batadv_netlink_get_hardif(bat_priv, cb);

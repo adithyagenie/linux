@@ -5,6 +5,7 @@
 
 #include <drm/drm_edid.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_managed.h>
 
 #include "dpu_writeback.h"
 
@@ -72,6 +73,9 @@ static int dpu_wb_conn_atomic_check(struct drm_connector *connector,
 		DPU_ERROR("invalid fb w=%d, maxlinewidth=%u\n",
 			  fb->width, dpu_wb_conn->maxlinewidth);
 		return -EINVAL;
+	} else if (fb->modifier != DRM_FORMAT_MOD_LINEAR) {
+		DPU_ERROR("unsupported fb modifier:%#llx\n", fb->modifier);
+		return -EINVAL;
 	}
 
 	return drm_atomic_helper_check_wb_connector_state(conn_state->connector, conn_state->state);
@@ -122,7 +126,7 @@ int dpu_writeback_init(struct drm_device *dev, struct drm_encoder *enc,
 	struct dpu_wb_connector *dpu_wb_conn;
 	int rc = 0;
 
-	dpu_wb_conn = devm_kzalloc(dev->dev, sizeof(*dpu_wb_conn), GFP_KERNEL);
+	dpu_wb_conn = drmm_kzalloc(dev, sizeof(*dpu_wb_conn), GFP_KERNEL);
 	if (!dpu_wb_conn)
 		return -ENOMEM;
 

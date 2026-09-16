@@ -122,6 +122,8 @@ static inline void free_tgts(struct cache_entry *ce)
 		kfree(t->name);
 		kfree(t);
 	}
+
+	WRITE_ONCE(ce->tgthint, NULL);
 }
 
 static inline void flush_cache_ent(struct cache_entry *ce)
@@ -869,13 +871,22 @@ int dfs_cache_find(const unsigned int xid, struct cifs_ses *ses, const struct nl
 		goto out_free_path;
 	}
 
-	if (ref)
-		rc = setup_referral(path, ce, ref, get_tgt_name(ce));
-	else
+	if (ref) {
+		char *target = get_tgt_name(ce);
+
+		if (IS_ERR(target)) {
+			rc = PTR_ERR(target);
+			goto out_unlock;
+		}
+		rc = setup_referral(path, ce, ref, target);
+	} else {
 		rc = 0;
+	}
+
 	if (!rc && tgt_list)
 		rc = get_targets(ce, tgt_list);
 
+out_unlock:
 	up_read(&htable_rw_lock);
 
 out_free_path:
@@ -915,10 +926,17 @@ int dfs_cache_noreq_find(const char *path, struct dfs_info3_param *ref,
 		goto out_unlock;
 	}
 
-	if (ref)
-		rc = setup_referral(path, ce, ref, get_tgt_name(ce));
-	else
+	if (ref) {
+		char *target = get_tgt_name(ce);
+
+		if (IS_ERR(target)) {
+			rc = PTR_ERR(target);
+			goto out_unlock;
+		}
+		rc = setup_referral(path, ce, ref, target);
+	} else {
 		rc = 0;
+	}
 	if (!rc && tgt_list)
 		rc = get_targets(ce, tgt_list);
 
@@ -959,7 +977,8 @@ void dfs_cache_noreq_update_tgthint(const char *path, const struct dfs_cache_tgt
 
 	t = READ_ONCE(ce->tgthint);
 
-	if (unlikely(!strcasecmp(it->it_name, t->name)))
+	/* Check 't' in case ce->tgthint was cleared by free_tgts() */
+	if (t && unlikely(!strcasecmp(it->it_name, t->name)))
 		goto out_unlock;
 
 	list_for_each_entry(t, &ce->tlist, list) {
@@ -1120,24 +1139,63 @@ static bool target_share_equal(struct cifs_tcon *tcon, const char *s1)
 	return match;
 }
 
-static bool is_ses_good(struct cifs_ses *ses)
+static bool is_ses_good(struct cifs_tcon *tcon, struct cifs_ses *ses)
 {
 	struct TCP_Server_Info *server = ses->server;
-	struct cifs_tcon *tcon = ses->tcon_ipc;
+	struct cifs_tcon *ipc = NULL;
 	bool ret;
 
+	spin_lock(&cifs_tcp_ses_lock);
 	spin_lock(&ses->ses_lock);
 	spin_lock(&ses->chan_lock);
+
 	ret = !cifs_chan_needs_reconnect(ses, server) &&
-		ses->ses_status == SES_GOOD &&
-		!tcon->need_reconnect;
+		ses->ses_status == SES_GOOD;
+
 	spin_unlock(&ses->chan_lock);
+
+	if (!ret)
+		goto out;
+
+	if (likely(ses->tcon_ipc)) {
+		if (ses->tcon_ipc->need_reconnect) {
+			ret = false;
+			goto out;
+		}
+	} else {
+		spin_unlock(&ses->ses_lock);
+		spin_unlock(&cifs_tcp_ses_lock);
+
+		ipc = cifs_setup_ipc(ses, tcon->seal);
+
+		spin_lock(&cifs_tcp_ses_lock);
+		spin_lock(&ses->ses_lock);
+		if (!IS_ERR(ipc)) {
+			if (!ses->tcon_ipc) {
+				ses->tcon_ipc = ipc;
+				ipc = NULL;
+			}
+		} else {
+			ret = false;
+			ipc = NULL;
+		}
+	}
+
+out:
 	spin_unlock(&ses->ses_lock);
+	spin_unlock(&cifs_tcp_ses_lock);
+	if (ipc && server->ops->tree_disconnect) {
+		unsigned int xid = get_xid();
+
+		(void)server->ops->tree_disconnect(xid, ipc);
+		_free_xid(xid);
+	}
+	tconInfoFree(ipc, netfs_trace_tcon_ref_free_ipc);
 	return ret;
 }
 
 /* Refresh dfs referral of @ses */
-static void refresh_ses_referral(struct cifs_ses *ses)
+static void refresh_ses_referral(struct cifs_tcon *tcon, struct cifs_ses *ses)
 {
 	struct cache_entry *ce;
 	unsigned int xid;
@@ -1153,7 +1211,7 @@ static void refresh_ses_referral(struct cifs_ses *ses)
 	}
 
 	ses = CIFS_DFS_ROOT_SES(ses);
-	if (!is_ses_good(ses)) {
+	if (!is_ses_good(tcon, ses)) {
 		cifs_dbg(FYI, "%s: skip cache refresh due to disconnected ipc\n",
 			 __func__);
 		goto out;
@@ -1241,7 +1299,7 @@ static void refresh_tcon_referral(struct cifs_tcon *tcon, bool force_refresh)
 	up_read(&htable_rw_lock);
 
 	ses = CIFS_DFS_ROOT_SES(ses);
-	if (!is_ses_good(ses)) {
+	if (!is_ses_good(tcon, ses)) {
 		cifs_dbg(FYI, "%s: skip cache refresh due to disconnected ipc\n",
 			 __func__);
 		goto out;
@@ -1309,7 +1367,7 @@ void dfs_cache_refresh(struct work_struct *work)
 	tcon = container_of(work, struct cifs_tcon, dfs_cache_work.work);
 
 	list_for_each_entry(ses, &tcon->dfs_ses_list, dlist)
-		refresh_ses_referral(ses);
+		refresh_ses_referral(tcon, ses);
 	refresh_tcon_referral(tcon, false);
 
 	queue_delayed_work(dfscache_wq, &tcon->dfs_cache_work,
