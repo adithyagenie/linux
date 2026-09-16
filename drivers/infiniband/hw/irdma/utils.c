@@ -251,7 +251,7 @@ int irdma_net_event(struct notifier_block *notifier, unsigned long event,
 		    void *ptr)
 {
 	struct neighbour *neigh = ptr;
-	struct net_device *real_dev, *netdev = (struct net_device *)neigh->dev;
+	struct net_device *real_dev, *netdev;
 	struct irdma_device *iwdev;
 	struct ib_device *ibdev;
 	__be32 *p;
@@ -260,6 +260,7 @@ int irdma_net_event(struct notifier_block *notifier, unsigned long event,
 
 	switch (event) {
 	case NETEVENT_NEIGH_UPDATE:
+		netdev = neigh->dev;
 		real_dev = rdma_vlan_dev_real_dev(netdev);
 		if (!real_dev)
 			real_dev = netdev;
@@ -1168,6 +1169,12 @@ void irdma_free_qp_rsrc(struct irdma_qp *iwqp)
 	iwqp->kqp.dma_mem.va = NULL;
 	kfree(iwqp->kqp.sq_wrid_mem);
 	kfree(iwqp->kqp.rq_wrid_mem);
+
+	if (iwqp->user_mode && iwqp->iwpbl) {
+		struct irdma_mr *iwmr = iwqp->iwpbl->iwmr;
+
+		refcount_dec(&iwmr->user_ring_refs);
+	}
 }
 
 /**
@@ -2324,8 +2331,6 @@ void irdma_modify_qp_to_err(struct irdma_sc_qp *sc_qp)
 	struct irdma_qp *qp = sc_qp->qp_uk.back_qp;
 	struct ib_qp_attr attr;
 
-	if (qp->iwdev->rf->reset)
-		return;
 	attr.qp_state = IB_QPS_ERR;
 
 	if (rdma_protocol_roce(qp->ibqp.device, 1))

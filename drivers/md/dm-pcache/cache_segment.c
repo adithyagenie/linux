@@ -56,7 +56,10 @@ static int cache_seg_info_load(struct pcache_cache_segment *cache_seg)
 		ret = -EIO;
 		goto out;
 	}
-	cache_seg->info_index = cache_seg_info_addr - cache_seg_info_addr_base;
+
+	cache_seg->info_index =
+		((char *)cache_seg_info_addr - (char *)cache_seg_info_addr_base) /
+		PCACHE_SEG_INFO_SIZE;
 out:
 	mutex_unlock(&cache_seg->info_lock);
 
@@ -240,8 +243,16 @@ struct pcache_cache_segment *get_cache_segment(struct pcache_cache *cache)
 
 	spin_lock(&cache->seg_map_lock);
 again:
-	seg_id = find_next_zero_bit(cache->seg_map, cache->n_segs, cache->last_cache_seg);
-	if (seg_id == cache->n_segs) {
+	/*
+	 * Only allocate initialized segments. cache_segs_init() initializes
+	 * cache_info.n_segs of the cache->n_segs device segments; a forged
+	 * smaller cache_info.n_segs leaves the rest as zeroed structs whose data
+	 * pointer is NULL. Bounding the search to cache_info.n_segs keeps such a
+	 * segment from reaching cache_kset_close(), which writes through it.
+	 */
+	seg_id = find_next_zero_bit(cache->seg_map, cache->cache_info.n_segs,
+				    cache->last_cache_seg);
+	if (seg_id == cache->cache_info.n_segs) {
 		/* reset the hint of ->last_cache_seg and retry */
 		if (cache->last_cache_seg) {
 			cache->last_cache_seg = 0;
