@@ -270,19 +270,31 @@ ff_layout_remove_mirror(struct nfs4_ff_layout_mirror *mirror)
 	mirror->layout = NULL;
 }
 
-static struct nfs4_ff_layout_mirror *ff_layout_alloc_mirror(gfp_t gfp_flags)
+static struct nfs4_ff_layout_mirror *ff_layout_alloc_mirror(u32 dss_count,
+							    gfp_t gfp_flags)
 {
 	struct nfs4_ff_layout_mirror *mirror;
-	u32 dss_id;
 
 	mirror = kzalloc(sizeof(*mirror), gfp_flags);
-	if (mirror != NULL) {
-		spin_lock_init(&mirror->lock);
-		refcount_set(&mirror->ref, 1);
-		INIT_LIST_HEAD(&mirror->mirrors);
-		for (dss_id = 0; dss_id < mirror->dss_count; dss_id++)
-			nfs_localio_file_init(&mirror->dss[dss_id].nfl);
+	if (mirror == NULL)
+		return NULL;
+
+	spin_lock_init(&mirror->lock);
+	refcount_set(&mirror->ref, 1);
+	INIT_LIST_HEAD(&mirror->mirrors);
+
+	mirror->dss_count = dss_count;
+	mirror->dss =
+		kcalloc(dss_count, sizeof(struct nfs4_ff_layout_ds_stripe),
+			gfp_flags);
+	if (mirror->dss == NULL) {
+		kfree(mirror);
+		return NULL;
 	}
+
+	for (u32 dss_id = 0; dss_id < mirror->dss_count; dss_id++)
+		nfs_localio_file_init(&mirror->dss[dss_id].nfl);
+
 	return mirror;
 }
 
@@ -507,16 +519,11 @@ ff_layout_alloc_lseg(struct pnfs_layout_hdr *lh,
 		if (dss_count > 1 && stripe_unit == 0)
 			goto out_err_free;
 
-		fls->mirror_array[i] = ff_layout_alloc_mirror(gfp_flags);
+		fls->mirror_array[i] = ff_layout_alloc_mirror(dss_count, gfp_flags);
 		if (fls->mirror_array[i] == NULL) {
 			rc = -ENOMEM;
 			goto out_err_free;
 		}
-
-		fls->mirror_array[i]->dss_count = dss_count;
-		fls->mirror_array[i]->dss =
-		    kcalloc(dss_count, sizeof(struct nfs4_ff_layout_ds_stripe),
-			    gfp_flags);
 
 		for (dss_id = 0; dss_id < dss_count; dss_id++) {
 			dss_info = &fls->mirror_array[i]->dss[dss_id];
@@ -545,6 +552,10 @@ ff_layout_alloc_lseg(struct pnfs_layout_hdr *lh,
 			if (!p)
 				goto out_err_free;
 			fh_count = be32_to_cpup(p);
+			if (fh_count == 0) {
+				rc = -EINVAL;
+				goto out_err_free;
+			}
 
 			dss_info->fh_versions =
 			    kcalloc(fh_count, sizeof(struct nfs_fh),
@@ -627,6 +638,9 @@ ff_layout_alloc_lseg(struct pnfs_layout_hdr *lh,
 	if (!p)
 		goto out_sort_mirrors;
 	fls->flags = be32_to_cpup(p);
+	if (fls->flags & FF_FLAGS_NO_IO_THRU_MDS)
+		set_bit(NFS4_FF_HDR_NO_IO_THRU_MDS,
+			&FF_LAYOUT_FROM_HDR(lh)->flags);
 
 	p = xdr_inline_decode(&stream, 4);
 	if (!p)
@@ -1176,6 +1190,16 @@ ff_layout_pg_get_mirror_count_write(struct nfs_pageio_descriptor *pgio,
 			0, NFS4_MAX_UINT64, IOMODE_RW,
 			NFS_I(pgio->pg_inode)->layout,
 			pgio->pg_lseg);
+	if (NFS_I(pgio->pg_inode)->layout &&
+	    ff_layout_hdr_no_fallback_to_mds(NFS_I(pgio->pg_inode)->layout)) {
+		/*
+		 * FF_FLAGS_NO_IO_THRU_MDS: no current lseg but the server's
+		 * policy forbids MDS fallback.  Surface -EAGAIN so writeback
+		 * retries rather than silently issuing the WRITE via MDS.
+		 */
+		pgio->pg_error = -EAGAIN;
+		goto out;
+	}
 	/* no lseg means that pnfs is not in use, so no mirroring here */
 	nfs_pageio_reset_write_mds(pgio);
 out:
@@ -1300,7 +1324,8 @@ static int ff_layout_async_handle_error_v4(struct rpc_task *task,
 	struct pnfs_layout_hdr *lo = lseg->pls_layout;
 	struct inode *inode = lo->plh_inode;
 	struct nfs4_deviceid_node *devid = FF_LAYOUT_DEVID_NODE(lseg, idx, dss_id);
-	struct nfs4_slot_table *tbl = &clp->cl_session->fc_slot_table;
+	struct nfs4_slot_table *tbl = nfs4_has_session(clp) ?
+		&clp->cl_session->fc_slot_table : clp->cl_slot_tbl;
 
 	switch (op_status) {
 	case NFS4_OK:
@@ -2195,6 +2220,14 @@ ff_layout_read_pagelist(struct nfs_pgio_header *hdr)
 out_failed:
 	if (ff_layout_avoid_mds_available_ds(lseg) && !ds_fatal_error)
 		return PNFS_TRY_AGAIN;
+	if (ff_layout_no_fallback_to_mds(lseg)) {
+		/*
+		 * FF_FLAGS_NO_IO_THRU_MDS: force fresh LAYOUTGET,
+		 * never fall through to MDS I/O.
+		 */
+		pnfs_error_mark_layout_for_return(hdr->inode, lseg);
+		return PNFS_TRY_AGAIN;
+	}
 	trace_pnfs_mds_fallback_read_pagelist(hdr->inode,
 			hdr->args.offset, hdr->args.count,
 			IOMODE_READ, NFS_I(hdr->inode)->layout, lseg);
@@ -2280,6 +2313,14 @@ ff_layout_write_pagelist(struct nfs_pgio_header *hdr, int sync)
 out_failed:
 	if (ff_layout_avoid_mds_available_ds(lseg) && !ds_fatal_error)
 		return PNFS_TRY_AGAIN;
+	if (ff_layout_no_fallback_to_mds(lseg)) {
+		/*
+		 * FF_FLAGS_NO_IO_THRU_MDS: force fresh LAYOUTGET,
+		 * never fall through to MDS I/O.
+		 */
+		pnfs_error_mark_layout_for_return(hdr->inode, lseg);
+		return PNFS_TRY_AGAIN;
+	}
 	trace_pnfs_mds_fallback_write_pagelist(hdr->inode,
 			hdr->args.offset, hdr->args.count,
 			IOMODE_RW, NFS_I(hdr->inode)->layout, lseg);

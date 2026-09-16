@@ -67,6 +67,9 @@
  * Register Page 0, General
  **************************/
 
+#define ZL_REG_INFO				ZL_REG(0, 0x00, 1)
+#define ZL_INFO_READY				BIT(7)
+
 #define ZL_REG_ID				ZL_REG(0, 0x01, 2)
 #define ZL_REG_REVISION				ZL_REG(0, 0x03, 2)
 #define ZL_REG_FW_VER				ZL_REG(0, 0x05, 2)
@@ -191,6 +194,7 @@
 #define ZL_REF_CONFIG_DIFF_EN			BIT(2)
 
 #define ZL_REG_REF_PHASE_OFFSET_COMP		ZL_REG(10, 0x28, 6)
+#define ZL_REG_REF_PHASE_OFFSET_COMP_32	ZL_REG(10, 0x28, 4)
 
 #define ZL_REG_REF_SYNC_CTRL			ZL_REG(10, 0x2e, 1)
 #define ZL_REF_SYNC_CTRL_MODE			GENMASK(2, 0)

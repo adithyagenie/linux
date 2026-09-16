@@ -47,6 +47,7 @@ use crate::{
     range_alloc::{RangeAllocator, ReserveNew, ReserveNewArgs},
     stats::BinderStats,
     thread::{PushWorkRes, Thread},
+    transaction::TransactionInfo,
     BinderfsProcFile, DArc, DLArc, DTRWrap, DeliverToRead,
 };
 
@@ -71,6 +72,33 @@ impl Mapping {
 // bitflags for defer_work.
 const PROC_DEFER_FLUSH: u8 = 1;
 const PROC_DEFER_RELEASE: u8 = 2;
+
+#[derive(Copy, Clone)]
+pub(crate) enum IsFrozen {
+    Yes,
+    No,
+    InProgress,
+}
+
+impl IsFrozen {
+    /// Whether incoming transactions should be rejected due to freeze.
+    pub(crate) fn is_frozen(self) -> bool {
+        match self {
+            IsFrozen::Yes => true,
+            IsFrozen::No => false,
+            IsFrozen::InProgress => true,
+        }
+    }
+
+    /// Whether freeze notifications consider this process frozen.
+    pub(crate) fn is_fully_frozen(self) -> bool {
+        match self {
+            IsFrozen::Yes => true,
+            IsFrozen::No => false,
+            IsFrozen::InProgress => false,
+        }
+    }
+}
 
 /// The fields of `Process` protected by the spinlock.
 pub(crate) struct ProcessInner {
@@ -98,7 +126,7 @@ pub(crate) struct ProcessInner {
     /// are woken up.
     outstanding_txns: u32,
     /// Process is frozen and unable to service binder transactions.
-    pub(crate) is_frozen: bool,
+    pub(crate) is_frozen: IsFrozen,
     /// Process received sync transactions since last frozen.
     pub(crate) sync_recv: bool,
     /// Process received async transactions since last frozen.
@@ -124,7 +152,7 @@ impl ProcessInner {
             started_thread_count: 0,
             defer_work: 0,
             outstanding_txns: 0,
-            is_frozen: false,
+            is_frozen: IsFrozen::No,
             sync_recv: false,
             async_recv: false,
             binderfs_file: None,
@@ -846,7 +874,11 @@ impl Process {
     pub(crate) fn get_transaction_node(&self, handle: u32) -> BinderResult<NodeRef> {
         // When handle is zero, try to get the context manager.
         if handle == 0 {
-            Ok(self.ctx.get_manager_node(true)?)
+            let node_ref = self.ctx.get_manager_node(true)?;
+            if core::ptr::eq(self, &*node_ref.node.owner) {
+                return Err(EINVAL.into());
+            }
+            Ok(node_ref)
         } else {
             Ok(self.get_node_from_handle(handle, true)?)
         }
@@ -888,6 +920,8 @@ impl Process {
 
         // To preserve original binder behaviour, we only fail requests where the manager tries to
         // increment references on itself.
+        let _to_free_freeze_listener;
+        let _to_free_freeze_listener_cleanup;
         let mut refs = self.node_refs.lock();
         if let Some(info) = refs.by_handle.get_mut(&handle) {
             if info.node_ref().update(inc, strong) {
@@ -903,6 +937,14 @@ impl Process {
                 unsafe { info.node_ref2().node.remove_node_info(info) };
 
                 let id = info.node_ref().node.global_id();
+
+                if let Some(freeze) = *info.freeze() {
+                    if let Some(fl) = refs.freeze_listeners.remove(&freeze) {
+                        _to_free_freeze_listener_cleanup = fl.on_process_cleanup(&self);
+                        _to_free_freeze_listener = fl;
+                    }
+                }
+
                 refs.by_handle.remove(&handle);
                 refs.by_node.remove(&id);
             }
@@ -940,16 +982,15 @@ impl Process {
         self: &Arc<Self>,
         debug_id: usize,
         size: usize,
-        is_oneway: bool,
-        from_pid: i32,
+        info: &mut TransactionInfo,
     ) -> BinderResult<NewAllocation> {
         use kernel::page::PAGE_SIZE;
 
         let mut reserve_new_args = ReserveNewArgs {
             debug_id,
             size,
-            is_oneway,
-            pid: from_pid,
+            is_oneway: info.is_oneway(),
+            pid: info.from_pid,
             ..ReserveNewArgs::default()
         };
 
@@ -965,13 +1006,13 @@ impl Process {
             reserve_new_args = alloc_request.make_alloc()?;
         };
 
+        info.oneway_spam_suspect = new_alloc.oneway_spam_detected;
         let res = Allocation::new(
             self.clone(),
             debug_id,
             new_alloc.offset,
             size,
             addr + new_alloc.offset,
-            new_alloc.oneway_spam_detected,
         );
 
         // This allocation will be marked as in use until the `Allocation` is used to free it.
@@ -1003,7 +1044,7 @@ impl Process {
         let mapping = inner.mapping.as_mut()?;
         let offset = ptr.checked_sub(mapping.address)?;
         let (size, debug_id, odata) = mapping.alloc.reserve_existing(offset).ok()?;
-        let mut alloc = Allocation::new(self.clone(), debug_id, offset, size, ptr, false);
+        let mut alloc = Allocation::new(self.clone(), debug_id, offset, size, ptr);
         if let Some(data) = odata {
             alloc.set_info(data);
         }
@@ -1232,7 +1273,8 @@ impl Process {
     }
 
     pub(crate) fn dead_binder_done(&self, cookie: u64, thread: &Thread) {
-        if let Some(death) = self.inner.lock().pull_delivered_death(cookie) {
+        let death = self.inner.lock().pull_delivered_death(cookie);
+        if let Some(death) = death {
             death.set_notification_done(thread);
         }
     }
@@ -1260,7 +1302,7 @@ impl Process {
         let is_manager = {
             let mut inner = self.inner.lock();
             inner.is_dead = true;
-            inner.is_frozen = false;
+            inner.is_frozen = IsFrozen::No;
             inner.sync_recv = false;
             inner.async_recv = false;
             inner.is_manager
@@ -1316,7 +1358,7 @@ impl Process {
         // Clean up freeze listeners.
         let freeze_listeners = take(&mut self.node_refs.lock().freeze_listeners);
         for listener in freeze_listeners.values() {
-            listener.on_process_exit(&self);
+            listener.on_process_cleanup(&self);
         }
         drop(freeze_listeners);
 
@@ -1335,8 +1377,17 @@ impl Process {
             work.into_arc().cancel();
         }
 
-        let delivered_deaths = take(&mut self.inner.lock().delivered_deaths);
-        drop(delivered_deaths);
+        // Clear delivered_deaths list.
+        //
+        // Scope ensures that MutexGuard is dropped while executing the body.
+        while let Some(delivered_death) = {
+            // Explicitly bind to avoid tail expression lifetime extension of the lockguard
+            // Can be removed when the kernel moves to edition 2024
+            let maybe_death = self.inner.lock().delivered_deaths.pop_front();
+            maybe_death
+        } {
+            drop(delivered_death);
+        }
 
         // Free any resources kept alive by allocated buffers.
         let omapping = self.inner.lock().mapping.take();
@@ -1346,12 +1397,7 @@ impl Process {
                 .alloc
                 .take_for_each(|offset, size, debug_id, odata| {
                     let ptr = offset + address;
-                    pr_warn!(
-                        "{}: removing orphan mapping {offset}:{size}\n",
-                        self.pid_in_current_ns()
-                    );
-                    let mut alloc =
-                        Allocation::new(self.clone(), debug_id, offset, size, ptr, false);
+                    let mut alloc = Allocation::new(self.clone(), debug_id, offset, size, ptr);
                     if let Some(data) = odata {
                         alloc.set_info(data);
                     }
@@ -1371,7 +1417,7 @@ impl Process {
                 return;
             }
             inner.outstanding_txns -= 1;
-            inner.is_frozen && inner.outstanding_txns == 0
+            inner.is_frozen.is_frozen() && inner.outstanding_txns == 0
         };
 
         if wake {
@@ -1385,7 +1431,7 @@ impl Process {
             let mut inner = self.inner.lock();
             inner.sync_recv = false;
             inner.async_recv = false;
-            inner.is_frozen = false;
+            inner.is_frozen = IsFrozen::No;
             drop(inner);
             msgs.send_messages();
             return Ok(());
@@ -1394,7 +1440,7 @@ impl Process {
         let mut inner = self.inner.lock();
         inner.sync_recv = false;
         inner.async_recv = false;
-        inner.is_frozen = true;
+        inner.is_frozen = IsFrozen::InProgress;
 
         if info.timeout_ms > 0 {
             let mut jiffies = kernel::time::msecs_to_jiffies(info.timeout_ms);
@@ -1408,7 +1454,7 @@ impl Process {
                     .wait_interruptible_timeout(&mut inner, jiffies)
                 {
                     CondVarTimeoutResult::Signal { .. } => {
-                        inner.is_frozen = false;
+                        inner.is_frozen = IsFrozen::No;
                         return Err(ERESTARTSYS);
                     }
                     CondVarTimeoutResult::Woken { jiffies: remaining } => {
@@ -1422,17 +1468,18 @@ impl Process {
         }
 
         if inner.txns_pending_locked() {
-            inner.is_frozen = false;
+            inner.is_frozen = IsFrozen::No;
             Err(EAGAIN)
         } else {
             drop(inner);
             match self.prepare_freeze_messages() {
                 Ok(batch) => {
+                    self.inner.lock().is_frozen = IsFrozen::Yes;
                     batch.send_messages();
                     Ok(())
                 }
                 Err(kernel::alloc::AllocError) => {
-                    self.inner.lock().is_frozen = false;
+                    self.inner.lock().is_frozen = IsFrozen::No;
                     Err(ENOMEM)
                 }
             }
@@ -1500,6 +1547,10 @@ impl Process {
         cmd: u32,
         reader: &mut UserSliceReader,
     ) -> Result {
+        if cmd == uapi::BINDER_FREEZE {
+            return ioctl_freeze(reader);
+        }
+
         let thread = this.get_current_thread()?;
         match cmd {
             uapi::BINDER_SET_MAX_THREADS => this.set_max_threads(reader.read()?),
@@ -1511,7 +1562,6 @@ impl Process {
             uapi::BINDER_ENABLE_ONEWAY_SPAM_DETECTION => {
                 this.set_oneway_spam_detection_enabled(reader.read()?)
             }
-            uapi::BINDER_FREEZE => ioctl_freeze(reader)?,
             _ => return Err(EINVAL),
         }
         Ok(())
@@ -1526,15 +1576,16 @@ impl Process {
         cmd: u32,
         data: UserSlice,
     ) -> Result {
-        let thread = this.get_current_thread()?;
         let blocking = (file.flags() & file::flags::O_NONBLOCK) == 0;
         match cmd {
-            uapi::BINDER_WRITE_READ => thread.write_read(data, blocking)?,
+            uapi::BINDER_WRITE_READ => this.get_current_thread()?.write_read(data, blocking)?,
             uapi::BINDER_GET_NODE_DEBUG_INFO => this.get_node_debug_info(data)?,
             uapi::BINDER_GET_NODE_INFO_FOR_REF => this.get_node_info_from_ref(data)?,
             uapi::BINDER_VERSION => this.version(data)?,
             uapi::BINDER_GET_FROZEN_INFO => get_frozen_status(data)?,
-            uapi::BINDER_GET_EXTENDED_ERROR => thread.get_extended_error(data)?,
+            uapi::BINDER_GET_EXTENDED_ERROR => {
+                this.get_current_thread()?.get_extended_error(data)?
+            }
             _ => return Err(EINVAL),
         }
         Ok(())

@@ -962,10 +962,15 @@ int xe_device_probe(struct xe_device *xe)
 	if (err)
 		goto err_unregister_display;
 
-	return devm_add_action_or_reset(xe->drm.dev, xe_device_sanitize, xe);
+	err = devm_add_action_or_reset(xe->drm.dev, xe_device_sanitize, xe);
+	if (err)
+		goto err_unregister_display;
+
+	return 0;
 
 err_unregister_display:
 	xe_display_unregister(xe);
+	drm_dev_unregister(&xe->drm);
 
 	return err;
 }
@@ -973,8 +978,6 @@ err_unregister_display:
 void xe_device_remove(struct xe_device *xe)
 {
 	xe_display_unregister(xe);
-
-	xe_nvm_fini(xe);
 
 	drm_dev_unplug(&xe->drm);
 
@@ -988,16 +991,16 @@ void xe_device_shutdown(struct xe_device *xe)
 
 	drm_dbg(&xe->drm, "Shutting down device\n");
 
-	if (xe_driver_flr_disabled(xe)) {
-		xe_display_pm_shutdown(xe);
+	xe_display_pm_shutdown(xe);
 
-		xe_irq_suspend(xe);
+	xe_irq_suspend(xe);
 
-		for_each_gt(gt, xe, id)
-			xe_gt_shutdown(gt);
+	for_each_gt(gt, xe, id)
+		xe_gt_shutdown(gt);
 
-		xe_display_pm_shutdown_late(xe);
-	} else {
+	xe_display_pm_shutdown_late(xe);
+
+	if (!xe_driver_flr_disabled(xe)) {
 		/* BOOM! */
 		__xe_driver_flr(xe);
 	}
@@ -1046,7 +1049,7 @@ static void tdf_request_sync(struct xe_device *xe)
 		 * transient and need to be flushed..
 		 */
 		if (xe_mmio_wait32(&gt->mmio, XE2_TDF_CTRL, TRANSIENT_FLUSH_REQUEST, 0,
-				   150, NULL, false))
+				   300, NULL, false))
 			xe_gt_err_once(gt, "TD flush timeout\n");
 
 		xe_force_wake_put(gt_to_fw(gt), fw_ref);
@@ -1070,7 +1073,7 @@ void xe_device_l2_flush(struct xe_device *xe)
 	spin_lock(&gt->global_invl_lock);
 
 	xe_mmio_write32(&gt->mmio, XE2_GLOBAL_INVAL, 0x1);
-	if (xe_mmio_wait32(&gt->mmio, XE2_GLOBAL_INVAL, 0x1, 0x0, 500, NULL, true))
+	if (xe_mmio_wait32(&gt->mmio, XE2_GLOBAL_INVAL, 0x1, 0x0, 1000, NULL, true))
 		xe_gt_err_once(gt, "Global invalidation timeout\n");
 
 	spin_unlock(&gt->global_invl_lock);

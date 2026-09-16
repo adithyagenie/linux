@@ -106,13 +106,22 @@ impl DeliverToRead for FreezeMessage {
             return Ok(true);
         }
         if freeze.is_clearing {
-            _removed_listener = freeze_entry.remove_node();
+            kernel::warn_on!(freeze.num_cleared_duplicates != 0);
+            if freeze.num_pending_duplicates > 0 {
+                // The primary freeze listener was deleted, so convert a pending duplicate back
+                // into the primary one.
+                freeze.num_pending_duplicates -= 1;
+                freeze.is_pending = true;
+                freeze.is_clearing = true;
+            } else {
+                _removed_listener = freeze_entry.remove_node();
+            }
             drop(node_refs);
             writer.write_code(BR_CLEAR_FREEZE_NOTIFICATION_DONE)?;
             writer.write_payload(&self.cookie.0)?;
             Ok(true)
         } else {
-            let is_frozen = freeze.node.owner.inner.lock().is_frozen;
+            let is_frozen = freeze.node.owner.inner.lock().is_frozen.is_fully_frozen();
             if freeze.last_is_frozen == Some(is_frozen) {
                 return Ok(true);
             }
@@ -145,10 +154,17 @@ impl DeliverToRead for FreezeMessage {
 }
 
 impl FreezeListener {
-    pub(crate) fn on_process_exit(&self, proc: &Arc<Process>) {
+    /// Called when this freeze listener is cleared abnormally.
+    ///
+    /// This occurs either because the process exited or because the process dropped its last
+    /// refcount on the node ref without explicitly removing the freeze listener first.
+    ///
+    /// The returned `KVVec` is just a value that should be dropped outside of the lock.
+    pub(crate) fn on_process_cleanup(&self, proc: &Process) -> KVVec<Arc<Process>> {
         if !self.is_clearing {
-            self.node.remove_freeze_listener(proc);
+            return self.node.remove_freeze_listener(proc);
         }
+        KVVec::new()
     }
 }
 
@@ -245,8 +261,9 @@ impl Process {
                 );
                 return Err(EINVAL);
             }
-            if freeze.is_clearing {
-                // Immediately send another FreezeMessage for BR_CLEAR_FREEZE_NOTIFICATION_DONE.
+            let is_frozen = freeze.node.owner.inner.lock().is_frozen.is_fully_frozen();
+            if freeze.is_clearing || freeze.last_is_frozen != Some(is_frozen) {
+                // Immediately send another FreezeMessage.
                 clear_msg = Some(FreezeMessage::init(alloc, cookie));
             }
             freeze.is_pending = false;

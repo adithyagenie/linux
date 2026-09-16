@@ -466,7 +466,7 @@ static void quicki2c_dma_adv_enable(struct quicki2c_device *qcdev)
 			dev_warn(qcdev->dev,
 				 "Max frame size is smaller than hid max input length!");
 			thc_i2c_set_rx_max_size(qcdev->thc_hw,
-						le16_to_cpu(qcdev->i2c_max_frame_size));
+						qcdev->i2c_max_frame_size);
 		}
 		thc_i2c_rx_max_size_enable(qcdev->thc_hw, true);
 	}
@@ -771,6 +771,7 @@ static void quicki2c_remove(struct pci_dev *pdev)
 	quicki2c_hid_remove(qcdev);
 	quicki2c_dma_deinit(qcdev);
 
+	pm_runtime_dont_use_autosuspend(qcdev->dev);
 	pm_runtime_get_noresume(qcdev->dev);
 
 	quicki2c_dev_deinit(qcdev);

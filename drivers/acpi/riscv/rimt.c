@@ -9,6 +9,7 @@
 
 #include <linux/acpi.h>
 #include <linux/acpi_rimt.h>
+#include <linux/device/driver.h>
 #include <linux/iommu.h>
 #include <linux/list.h>
 #include <linux/pci.h>
@@ -59,30 +60,6 @@ static int rimt_set_fwnode(struct acpi_rimt_node *rimt_node,
 	spin_unlock(&rimt_fwnode_lock);
 
 	return 0;
-}
-
-/**
- * rimt_get_fwnode() - Retrieve fwnode associated with an RIMT node
- *
- * @node: RIMT table node to be looked-up
- *
- * Returns: fwnode_handle pointer on success, NULL on failure
- */
-static struct fwnode_handle *rimt_get_fwnode(struct acpi_rimt_node *node)
-{
-	struct fwnode_handle *fwnode = NULL;
-	struct rimt_fwnode *curr;
-
-	spin_lock(&rimt_fwnode_lock);
-	list_for_each_entry(curr, &rimt_fwnode_list, list) {
-		if (curr->rimt_node == node) {
-			fwnode = curr->fwnode;
-			break;
-		}
-	}
-	spin_unlock(&rimt_fwnode_lock);
-
-	return fwnode;
 }
 
 static acpi_status rimt_match_node_callback(struct acpi_rimt_node *node,
@@ -202,6 +179,67 @@ static struct acpi_rimt_node *rimt_scan_node(enum acpi_rimt_node_type type,
 	return NULL;
 }
 
+/*
+ * RISC-V supports IOMMU as a PCI device or a platform device.
+ * When it is a platform device, there should be a namespace device as
+ * well along with RIMT. To create the link between RIMT information and
+ * the platform device, the IOMMU driver should register itself with the
+ * RIMT module. This is true for PCI based IOMMU as well.
+ */
+int rimt_iommu_register(struct device *dev)
+{
+	struct fwnode_handle *rimt_fwnode;
+	struct acpi_rimt_node *node;
+
+	node = rimt_scan_node(ACPI_RIMT_NODE_TYPE_IOMMU, dev);
+	if (!node) {
+		pr_err("Could not find IOMMU node in RIMT\n");
+		return -ENODEV;
+	}
+
+	if (dev_is_pci(dev)) {
+		rimt_fwnode = acpi_alloc_fwnode_static();
+		if (!rimt_fwnode)
+			return -ENOMEM;
+
+		rimt_fwnode->dev = dev;
+		if (!dev->fwnode)
+			dev->fwnode = rimt_fwnode;
+
+		rimt_set_fwnode(node, rimt_fwnode);
+	} else {
+		rimt_set_fwnode(node, dev->fwnode);
+	}
+
+	return 0;
+}
+
+#ifdef CONFIG_IOMMU_API
+
+/**
+ * rimt_get_fwnode() - Retrieve fwnode associated with an RIMT node
+ *
+ * @node: RIMT table node to be looked-up
+ *
+ * Returns: fwnode_handle pointer on success, NULL on failure
+ */
+static struct fwnode_handle *rimt_get_fwnode(struct acpi_rimt_node *node)
+{
+	struct fwnode_handle *fwnode = NULL;
+	struct rimt_fwnode *curr;
+
+	spin_lock(&rimt_fwnode_lock);
+	list_for_each_entry(curr, &rimt_fwnode_list, list) {
+		if (curr->rimt_node == node) {
+			fwnode = curr->fwnode;
+			break;
+		}
+	}
+	spin_unlock(&rimt_fwnode_lock);
+
+	return fwnode;
+}
+
 static bool rimt_pcie_rc_supports_ats(struct acpi_rimt_node *node)
 {
 	struct acpi_rimt_pcie_rc *pci_rc;
@@ -220,12 +258,19 @@ static int rimt_iommu_xlate(struct device *dev, struct acpi_rimt_node *node, u32
 	rimt_fwnode = rimt_get_fwnode(node);
 
 	/*
-	 * The IOMMU drivers may not be probed yet.
-	 * Defer the IOMMU configuration
+	 * The IOMMU drivers may not be probed yet. Defer the IOMMU
+	 * configuration if it's still in initialization stage.
 	 */
 	if (!rimt_fwnode)
-		return -EPROBE_DEFER;
+		return driver_deferred_probe_check_state(dev);
 
+	/*
+	 * EPROBE_DEFER ensures IOMMU is probed before the devices that
+	 * depend on them. During shutdown, however, the IOMMU may be removed
+	 * first, leading to issues. To avoid this, a device link is added
+	 * which enforces the correct removal order.
+	 */
+	device_link_add(dev, rimt_fwnode->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
 	return acpi_iommu_fwspec_init(dev, deviceid, rimt_fwnode);
 }
 
@@ -289,43 +334,6 @@ static struct acpi_rimt_node *rimt_node_get_id(struct acpi_rimt_node *node,
 
 	return NULL;
 }
-
-/*
- * RISC-V supports IOMMU as a PCI device or a platform device.
- * When it is a platform device, there should be a namespace device as
- * well along with RIMT. To create the link between RIMT information and
- * the platform device, the IOMMU driver should register itself with the
- * RIMT module. This is true for PCI based IOMMU as well.
- */
-int rimt_iommu_register(struct device *dev)
-{
-	struct fwnode_handle *rimt_fwnode;
-	struct acpi_rimt_node *node;
-
-	node = rimt_scan_node(ACPI_RIMT_NODE_TYPE_IOMMU, dev);
-	if (!node) {
-		pr_err("Could not find IOMMU node in RIMT\n");
-		return -ENODEV;
-	}
-
-	if (dev_is_pci(dev)) {
-		rimt_fwnode = acpi_alloc_fwnode_static();
-		if (!rimt_fwnode)
-			return -ENOMEM;
-
-		rimt_fwnode->dev = dev;
-		if (!dev->fwnode)
-			dev->fwnode = rimt_fwnode;
-
-		rimt_set_fwnode(node, rimt_fwnode);
-	} else {
-		rimt_set_fwnode(node, dev->fwnode);
-	}
-
-	return 0;
-}
-
-#ifdef CONFIG_IOMMU_API
 
 static struct acpi_rimt_node *rimt_node_map_id(struct acpi_rimt_node *node,
 					       u32 id_in, u32 *id_out,

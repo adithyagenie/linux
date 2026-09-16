@@ -409,6 +409,8 @@ static void cpa_collapse_large_pages(struct cpa_data *cpa)
 	int collapsed = 0;
 	int i;
 
+	spin_lock(&cpa_lock);
+
 	if (cpa->flags & (CPA_PAGES_ARRAY | CPA_ARRAY)) {
 		for (i = 0; i < cpa->numpages; i++)
 			collapsed += collapse_large_pages(__cpa_addr(cpa, i),
@@ -422,15 +424,19 @@ static void cpa_collapse_large_pages(struct cpa_data *cpa)
 			collapsed += collapse_large_pages(addr, &pgtables);
 	}
 
-	if (!collapsed)
+	if (!collapsed) {
+		spin_unlock(&cpa_lock);
 		return;
+	}
 
 	flush_tlb_all();
 
 	list_for_each_entry_safe(ptdesc, tmp, &pgtables, pt_list) {
 		list_del(&ptdesc->pt_list);
-		__free_page(ptdesc_page(ptdesc));
+		pagetable_free(ptdesc);
 	}
+
+	spin_unlock(&cpa_lock);
 }
 
 static void cpa_flush(struct cpa_data *cpa, int cache)
@@ -446,7 +452,7 @@ static void cpa_flush(struct cpa_data *cpa, int cache)
 	}
 
 	start = fix_addr(__cpa_addr(cpa, 0));
-	end =   fix_addr(__cpa_addr(cpa, cpa->numpages));
+	end =   start + cpa->numpages * PAGE_SIZE;
 	if (cpa->force_flush_all)
 		end = TLB_FLUSH_ALL;
 

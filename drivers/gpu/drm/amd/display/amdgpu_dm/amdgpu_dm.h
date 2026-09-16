@@ -60,6 +60,10 @@
 #define AMDGPU_HDR_MULT_DEFAULT (0x100000000LL)
 
 /*
+ * Maximum HDMI HPD debounce delay in milliseconds
+ */
+#define AMDGPU_DM_MAX_HDMI_HPD_DEBOUNCE_MS 5000
+/*
 #include "include/amdgpu_dal_power_if.h"
 #include "amdgpu_dm_irq.h"
 */
@@ -631,13 +635,6 @@ struct amdgpu_display_manager {
 	u32 actual_brightness[AMDGPU_DM_MAX_NUM_EDP];
 
 	/**
-	 * @restore_backlight:
-	 *
-	 * Flag to indicate whether to restore backlight after modeset.
-	 */
-	bool restore_backlight;
-
-	/**
 	 * @aux_hpd_discon_quirk:
 	 *
 	 * quirk for hpd discon while aux is on-going.
@@ -666,6 +663,13 @@ struct amdgpu_display_manager {
 	 * Data is stored as a byte array that should be casted to the appropriate bb struct
 	 */
 	void *bb_from_dmub;
+
+	/**
+	 * @i2c_devres_group:
+	 *
+	 * Devres group for DM i2c adapter lifetime management.
+	 */
+	void *i2c_devres_group;
 
 	/**
 	 * @oem_i2c:
@@ -826,6 +830,11 @@ struct amdgpu_dm_connector {
 	bool pack_sdp_v1_3;
 	enum adaptive_sync_type as_type;
 	struct amdgpu_hdmi_vsdb_info vsdb_info;
+
+	/* HDMI HPD debounce support */
+	unsigned int hdmi_hpd_debounce_delay_ms;
+	struct delayed_work hdmi_hpd_debounce_work;
+	struct dc_sink *hdmi_prev_sink;
 };
 
 static inline void amdgpu_dm_set_mst_status(uint8_t *status,
@@ -963,6 +972,7 @@ struct dm_crtc_state {
 
 	bool freesync_vrr_info_changed;
 
+	bool mode_changed_independent_from_dsc;
 	bool dsc_force_changed;
 	bool vrr_supported;
 	struct mod_freesync_config freesync_config;
